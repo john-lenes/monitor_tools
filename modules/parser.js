@@ -100,12 +100,25 @@ export function parseQueryParams(url) {
  *
  * Glossário Sankhya:
  *  nunota      — número único de nota fiscal / pedido / título
+ *  nufin       — número de título financeiro
  *  codemp      — código da empresa (multi-empresa)
+ *  codfilial   — código da filial
  *  codparc     — código do parceiro (cliente/fornecedor)
  *  codprod     — código do produto
  *  nuseq       — número de sequência (item de nota, linha de grid)
+ *  codvend     — código do vendedor
+ *  codusu      — código do usuário que executou
+ *  codusuinc   — código do usuário que incluíu
+ *  codusualt   — código do usuário que alterou
+ *  codtipoper  — código do tipo de operação (TOP)
+ *  codnat      — código da natureza de operação
+ *  codcencus   — código do centro de custo
+ *  codloc      — código do local de estoque
+ *  codest      — código do estado
  *  id          — identificador genérico de entidade
  *  entityname  — nome da entidade MGE (ex: "NF", "TGFCAB", "TGFITE")
+ *  tipo        — tipo da operação ou do registro
+ *  origem      — origem da operação
  *  action      — ação executada (ex: "save", "delete", "execute")
  *  event       — evento disparado (ex: "beforeSave", "afterLoad")
  *  listener    — listener de evento registrado no servidor
@@ -113,13 +126,32 @@ export function parseQueryParams(url) {
  *  servicename — nome do serviço Sankhya (ex: "CRUDService.save")
  *  application — código da aplicação/tela (ex: "NF", "RegistroProducao")
  *  resourceid  — identificador do recurso de negócio
- *
- * A busca é case-insensitive via `.toLowerCase()` no extractBusinessFields.
+ *  offset      — paginação: registro inicial
+ *  limit       — paginação: quantidade de registros por página
+ *  orderby     — campo de ordenação do grid
+ *  criteria    — critério de filtro (cláusula WHERE simplificada)
+ *  where       — cláusula WHERE SQL direta (indica query customizada)
+ *  vlrnota     — valor monetário da nota
  */
 const BUSINESS_FIELDS = [
-  'nunota', 'codemp', 'codparc', 'codprod', 'nuseq', 'id',
-  'entityname', 'action', 'event', 'listener', 'method',
+  // Identificadores de nota / transação
+  'nunota', 'nufin', 'nuseq',
+  // Códigos organizacionais
+  'codemp', 'codfilial', 'codparc', 'codprod', 'codvend',
+  'codusu', 'codusuinc', 'codusualt',
+  // Classificações e tipos
+  'codtipoper', 'codnat', 'codcencus', 'codloc', 'codest',
+  'tipo', 'origem',
+  // Identificador genérico e entidade
+  'id', 'entityname',
+  // Ações e eventos
+  'action', 'event', 'listener', 'method',
+  // Serviço e aplicação
   'servicename', 'application', 'resourceid',
+  // Paginação e filtragem (indica tamanho e complexidade da query)
+  'offset', 'limit', 'orderby', 'criteria', 'where',
+  // Financeiro
+  'vlrnota',
 ];
 
 /**
@@ -208,7 +240,10 @@ export function parsePayload(body) {
 
   if (!body || typeof body !== 'string') return result;
 
-  result.raw = body.substring(0, 600);
+  // Preserva os primeiros 1200 chars do body para exibição no relatório.
+  // 1200 chars cobrem a maioria dos payloads Sankhya (data= + JSON aninhado)
+  // sem inflar desnecessariamente o storage.
+  result.raw = body.substring(0, 1200);
 
   // [TENTATIVA 1] JSON puro — APIs REST, chamadas modernas
   try {
@@ -275,14 +310,18 @@ export function parsePayload(body) {
  *                              Presente em respostas estruturadas do service.sbr.
  */
 const ERROR_PATTERNS = [
-  /NullPointerException/i,                                          // bug Java no servidor
-  /ORA-\d{4,}/,                                                     // erro Oracle Database
-  /java\.lang\.\w+Exception/i,                                      // exceção Java genérica
-  /stacktrace[\s\S]{0,30}:/i,                                       // campo de stacktrace serializado
-  /Timeout/i,                                                       // timeout de serviço/banco
-  /Exception/i,                                                     // exceção não categorizada
-  /"statusMessage"\s*:\s*"[^"]*(?:error|erro|falha|falhou)[^"]*"/i, // status de erro em JSON
-  /"status"\s*:\s*"1"/,                                             // status Sankhya: 1 = erro
+  /NullPointerException/i,                                                  // bug Java no servidor
+  /ORA-\d{4,}/,                                                             // erro Oracle Database
+  /java\.lang\.\w+Exception/i,                                              // exceção Java genérica
+  /java\.\w+\.\w+Exception/i,                                               // exceção Java de outros pacotes
+  /stacktrace[\s\S]{0,30}:/i,                                               // campo de stacktrace serializado
+  /Timeout/i,                                                               // timeout de serviço/banco
+  /Exception/i,                                                             // exceção não categorizada
+  /"errorMessage"\s*:\s*"[^"]{3,}"/i,                                        // campo errorMessage direto na resposta
+  /"detailedMessage"\s*:\s*"[^"]{3,}"/i,                                     // mensagem detalhada de erro estruturado
+  /"statusDescription"\s*:\s*"[^"]*(?:error|erro|falha|falhou|inválido)[^"]*"/i, // status description com palavra de erro
+  /"statusMessage"\s*:\s*"[^"]*(?:error|erro|falha|falhou)[^"]*"/i,          // status de erro em JSON
+  /"status"\s*:\s*"1"/,                                                     // status Sankhya: 1 = erro
 ];
 
 /**
@@ -333,13 +372,17 @@ export function parseResponse(responseBody) {
 
     // FORMATO 1: Resposta padrão do service.sbr
     // { "responseBody": { "status": "0"|"1", "statusMessage": "..." } }
-    // onde status "0" = OK e status "1" = erro de negócio/servidor
     const rb = json.responseBody;
     if (rb) {
       if (rb.statusMessage) result.statusMessage = rb.statusMessage;
       if (rb.status === '1' || rb.status === 1) {
         result.hasError = true;
-        result.errorMessage = rb.statusMessage || result.errorMessage || 'Erro interno no responseBody';
+        result.errorMessage = rb.statusMessage || rb.errorMessage || result.errorMessage || 'Erro interno no responseBody';
+      }
+      // Campo errorMessage direto no responseBody (alguns serviços Sankhya)
+      if (rb.errorMessage && !result.errorMessage) {
+        result.hasError = true;
+        result.errorMessage = rb.errorMessage;
       }
     }
 
@@ -350,6 +393,24 @@ export function parseResponse(responseBody) {
       if (sv === 'error' || sv === '1') {
         result.hasError = true;
         result.errorMessage = json.status.message || result.errorMessage || 'Erro reportado pelo servidor';
+      }
+    }
+
+    // FORMATO 3: Campos de erro diretos na raiz
+    // ex: { "errorMessage": "...", "detailedMessage": "..." }
+    if (json.errorMessage && !result.errorMessage) {
+      result.hasError = true;
+      result.errorMessage = json.errorMessage;
+    }
+    if (json.detailedMessage && !result.errorMessage) {
+      result.hasError = true;
+      result.errorMessage = json.detailedMessage;
+    }
+    if (json.statusDescription && !result.statusMessage) {
+      result.statusMessage = json.statusDescription;
+      if (/erro|error|falha|failed|inválido/i.test(json.statusDescription)) {
+        result.hasError = true;
+        if (!result.errorMessage) result.errorMessage = json.statusDescription;
       }
     }
   } catch (_) { /* não é JSON válido — análise por regex já foi feita acima */ }

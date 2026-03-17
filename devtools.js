@@ -68,13 +68,13 @@ chrome.devtools.network.onRequestFinished.addListener((entry) => {
 
   // Extrai request body
   let requestBody = null;
-  if (req.postData?.text)     requestBody = req.postData.text.substring(0, 5000);
+  if (req.postData?.text)     requestBody = req.postData.text.substring(0, 8192);
   else if (req.postData?.params) {
     // Formato de formulário: array de { name, value }
     requestBody = req.postData.params
       .map((p) => `${encodeURIComponent(p.name)}=${encodeURIComponent(p.value || '')}`)
       .join('&')
-      .substring(0, 5000);
+      .substring(0, 8192);
   }
 
   // Extrai response body de forma assíncrona (API HAR do DevTools)
@@ -101,7 +101,7 @@ chrome.devtools.network.onRequestFinished.addListener((entry) => {
           url,
           method:          (req.method || 'GET').toUpperCase(),
           requestBody,
-          responseBody:    (responseBody || '').substring(0, 5000),
+          responseBody:    (responseBody || '').substring(0, 8192),
           statusCode:      resp.status || 0,
           duration,
           timestamp,

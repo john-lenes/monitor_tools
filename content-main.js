@@ -30,8 +30,10 @@
   // Prefixo da mensagem — deve ser idêntico ao content-bridge.js
   const MSG_TYPE = '__SNKY_MON_CAPTURE__';
 
-  // Tamanho máximo do corpo (request/response) enviado à extensão
-  const MAX_BODY_LEN = 5000;
+  // Tamanho máximo do corpo (request/response) enviado à extensão.
+  // 8192 bytes = 8 KB: cobre o payload JSON típico do Sankhya sem
+  // comprometer a memória da página em sessões com muitas requisições.
+  const MAX_BODY_LEN = 8192;
 
   // ---------------------------------------------------------------------------
   // Filtros rápidos (executados no MAIN world para não sobrecarregar o bridge)

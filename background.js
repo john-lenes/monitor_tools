@@ -32,7 +32,7 @@
  *  SECONDARY → devtools.js via chrome.devtools.network (requer painel aberto)
  */
 
-import { normalizeRequest, isDuplicate, isWorthProcessing } from './modules/capture.js';
+import { normalizeRequest, findDuplicate, mergeWithDevtools, isWorthProcessing } from './modules/capture.js';
 import { parseQueryParams, parsePayload, parseResponse }    from './modules/parser.js';
 import { classifyRequest, isStaticAsset, isPolling }        from './modules/classifier.js';
 import { generateTextReport, getSessionStats }              from './modules/reporter.js';
@@ -102,9 +102,31 @@ async function processAndStore(raw, source) {
   //           Mapeia campos de nomes diferentes (statusCode vs status) em um só formato.
   const normalized = normalizeRequest(raw, source);
 
-  // [Passo 5] Deduplicar — janela de 500ms evita que a mesma requisição
-  //           capturada por content-main.js E por devtools.js seja contada duas vezes.
-  if (isDuplicate(normalized, session.requests || [])) return;
+  // [Passo 5] Dedução inteligente com merge:
+  //   - Se já existe uma entrada do content-main.js para esta requisição E
+  //     a nova captura veio do DevTools, ENRIQUECEMOS a entrada existente
+  //     com os dados mais completos do DevTools (response body, duration, headers).
+  //   - Se a duplicata veio do content script, descartamos (entrada já existe).
+  const existing = findDuplicate(normalized, session.requests || []);
+  if (existing) {
+    if (source === 'devtools') {
+      // Enriquece a entrada com dados mais completos do DevTools
+      mergeWithDevtools(existing, normalized);
+      // Re-parseia com o response body agora mais completo
+      existing.parsedResponse = parseResponse(existing.responseBody);
+      // Re-parseia payload se o request body melhorou
+      if (normalized.requestBody && normalized.requestBody.length > (existing.requestBody?.length ?? 0)) {
+        existing.parsedPayload = parsePayload(existing.requestBody);
+      }
+      // Re-classifica com os dados enriquecidos (pode detectar erro antes não visível)
+      existing.classification = classifyRequest(existing);
+      await writeStorage(State.MONITORING, session);
+      // Notifica o popup para atualizar o item já exibido
+      const mergeStats = getSessionStats(session.requests);
+      chrome.runtime.sendMessage({ action: 'REQUEST_ADDED', request: existing, stats: mergeStats }).catch(() => {});
+    }
+    return;
+  }
 
   // [Passo 6–8] Parsear URL, body e response
   normalized.queryParams    = parseQueryParams(normalized.url);

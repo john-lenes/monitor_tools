@@ -92,9 +92,13 @@ export function normalizeRequest(raw, source = 'content') {
     timestamp:       Number(raw.timestamp || Date.now()),  // epoch ms de início
     requestHeaders:  sanitizeHeaders(raw.requestHeaders),
     responseHeaders: sanitizeHeaders(raw.responseHeaders),
-    // Trunca corpos para proteger o chrome.storage.local de overflow
-    requestBody:     truncate(raw.requestBody, 4096),
-    responseBody:    truncate(raw.responseBody, 4096),
+    // Trunca corpos para proteger o chrome.storage.local de overflow.
+    // Limite: 8192 bytes ≈ 8 KB por corpo — cobre a maioria das respostas
+    // Sankhya (grids pequenos, JSON de negócio) sem saturar o storage em
+    // sessões longas. Respostas maiores (grids de centenas de linhas) ficam
+    // parcialmente truncadas mas ainda contêm dados suficientes para diagnóstico.
+    requestBody:     truncate(raw.requestBody, 8192),
+    responseBody:    truncate(raw.responseBody, 8192),
   };
 }
 
@@ -140,31 +144,73 @@ function truncate(value, maxLen) {
 // ---------------------------------------------------------------------------
 
 /**
- * Detecta se uma requisição já foi registrada pela outra fonte de captura.
+ * Encontra a entrada existente que corresponde à nova requisição.
+ * Retorna a entrada ou null (null = não é duplicata, deve ser adicionada).
  *
- * Critério de duplicata: mesma URL + mesmo método HTTP + timestamps a menos
- * de 500 ms de diferença.
+ * Critério de duplicata: mesma URL + mesmo método HTTP + timestamps a
+ * menos de 500ms de diferença (cobre o delta entre a captura do content
+ * script no momento do send() e a captura do DevTools no onRequestFinished).
  *
- * Por que 500 ms?
- *  Quando o painel DevTools está aberto, tanto content-main.js quanto
- *  devtools.js capturam a mesma requisição. O content script captura no
- *  momento em que o `send()` é chamado (antes da rede), enquanto o DevTools
- *  captura no `onRequestFinished` (depois da rede). O delta real é o tempo
- *  de resposta da chamada — chamadas lentas (> 500 ms) só chegam ao DevTools
- *  depois do threshold, mas para fins de deduplicação o que importa é o
- *  `timestamp` de INÍCIO, que ambas as fontes registram de forma próxima.
- *  Janela de 500 ms cobre variações de clock e scheduling do Chrome.
+ * Substituiu `isDuplicate` (boolean) para permitir merge inteligente no
+ * background.js: quando o DevTools captura algo que o content já registrou,
+ * enriquecemos a entrada em vez de descartar os dados melhores do DevTools.
  *
  * @param {Object}   newReq     request normalizado recém chegado
  * @param {Object[]} existing   lista de requests já salvos na sessão atual
- * @returns {boolean}  true = é duplicata, deve ser descartado
+ * @returns {Object|null}  entrada existente ou null
  */
-export function isDuplicate(newReq, existing = []) {
-  return existing.some((r) =>
+export function findDuplicate(newReq, existing = []) {
+  return existing.find((r) =>
     r.url    === newReq.url &&
     r.method === newReq.method &&
     Math.abs(r.timestamp - newReq.timestamp) < 500,
-  );
+  ) ?? null;
+}
+
+/**
+ * Enriquece uma requisição content-capturada com dados mais completos do DevTools.
+ *
+ * Por que o DevTools tem dados melhores?
+ *  - responseBody: o content script lê `responseText` com limite MAX_BODY_LEN;
+ *    o DevTools acessa o buffer completo via getContent() (HAR API).
+ *  - duration: medido na camada de rede (HAR) — mais preciso que clock JS.
+ *  - status HTTP: o HAR reporta o código real independente de CORS.
+ *  - responseHeaders: DevTools vê todos os headers, inclusive os que o
+ *    browser bloqueia para scripts (ex: Set-Cookie, Content-Security-Policy).
+ *
+ * Muta `target` in place (a entrada já no storage) para evitar custos de cópia.
+ *
+ * @param {Object} target       entrada existente na sessão (source='content')
+ * @param {Object} devtoolsReq  dados normalizados com source='devtools'
+ */
+export function mergeWithDevtools(target, devtoolsReq) {
+  // Prefere response body mais longo (mais completo, menos truncado)
+  if (
+    devtoolsReq.responseBody &&
+    devtoolsReq.responseBody.length > (target.responseBody?.length ?? 0)
+  ) {
+    target.responseBody = devtoolsReq.responseBody;
+  }
+
+  // request body do DevTools vem do postData.text (formato HAR) — pode ser
+  // mais completo se o content script não capturou por ser FormData/Blob
+  if (devtoolsReq.requestBody && devtoolsReq.requestBody.length > (target.requestBody?.length ?? 0)) {
+    target.requestBody = devtoolsReq.requestBody;
+  }
+
+  // Status HTTP do DevTools (HAR) é autoritativo
+  if (devtoolsReq.status > 0) target.status = devtoolsReq.status;
+
+  // Duration do HAR (camada de rede) é mais preciso que clock JS
+  if (devtoolsReq.duration > 0) target.duration = devtoolsReq.duration;
+
+  // Resposta headers: devtools tem acesso a headers normalmente ocultos
+  if (devtoolsReq.responseHeaders && Object.keys(devtoolsReq.responseHeaders).length > 0) {
+    target.responseHeaders = { ...target.responseHeaders, ...devtoolsReq.responseHeaders };
+  }
+
+  // Marca a entrada como enriquecida para fins de diagnóstico no relatório
+  target.source = 'merged';
 }
 
 // ---------------------------------------------------------------------------
