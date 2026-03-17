@@ -205,6 +205,28 @@
     .suggestion-list li:last-child { border-bottom: none; }
     .suggestion-list li::before { content: '→'; color: var(--muted); flex-shrink: 0; }
 
+    /* ── Serviços SP ─────────────────────────────────────── */
+    .tab-btn.sp-tab { color: #f59e0b; border-bottom-color: transparent; }
+    .tab-btn.sp-tab.active { color: #f59e0b; border-bottom-color: #f59e0b; }
+    .sp-cards { display: flex; flex-direction: column; gap: 12px; margin-bottom: 8px; }
+    .sp-card {
+      background: var(--surface);
+      border: 1px solid #f59e0b55;
+      border-left: 3px solid #f59e0b;
+      border-radius: var(--radius);
+      padding: 12px 14px;
+    }
+    .sp-card-header {
+      display: flex; align-items: center; gap: 8px;
+      margin-bottom: 8px; font-size: 13px;
+    }
+    .sp-badge {
+      background: #f59e0b22; color: #f59e0b;
+      border: 1px solid #f59e0b55;
+      border-radius: 4px; padding: 0 6px;
+      font-size: 11px; font-weight: 700; flex-shrink: 0;
+    }
+
     /* ── Text report ─────────────────────────────────────── */
     #text-report {
       background: var(--surface);

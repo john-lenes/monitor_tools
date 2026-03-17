@@ -19,7 +19,7 @@
  *  NÃO depende de popup.js — carrega dados do background diretamente.
  */
 
-import { generateTextReport, generateSuggestions, getSessionStats } from './modules/reporter.js';
+import { generateTextReport, generateSuggestions, getSessionStats, getServiceMap } from './modules/reporter.js';
 
 // ---------------------------------------------------------------------------
 // Bootstrap
@@ -62,13 +62,15 @@ import { generateTextReport, generateSuggestions, getSessionStats } from './modu
 // ---------------------------------------------------------------------------
 
 function renderPage(container, session, status) {
-  const stats       = getSessionStats(session.requests);
-  const suggestions = generateSuggestions(session.requests);
+  const stats                       = getSessionStats(session.requests);
+  const suggestions                 = generateSuggestions(session.requests);
+  const { spServices, otherServices } = getServiceMap(session.requests);
   const relevant    = session.requests
     .filter((r) => r.classification?.category !== 'IRRELEVANTE')
     .sort((a, b) => (b.duration || 0) - (a.duration || 0));
 
   const criticals = session.requests.filter((r) => r.classification?.isCritical);
+  const totalServices = spServices.length + otherServices.length;
 
   container.innerHTML = `
     <!-- Header -->
@@ -115,6 +117,10 @@ function renderPage(container, session, status) {
         <span class="val">${fmtDuration(stats.avgDuration)}</span>
         <span class="lbl">T. Médio</span>
       </div>
+      <div class="stat-card" style="border-color:#f59e0b">
+        <span class="val" style="color:#f59e0b">${stats.spCount || 0}</span>
+        <span class="lbl">Serviços SP</span>
+      </div>
     </div>
 
     <!-- Category chips -->
@@ -124,6 +130,7 @@ function renderPage(container, session, status) {
     <div class="tabs">
       <button class="tab-btn active" data-tab="calls">Chamadas (${relevant.length})</button>
       <button class="tab-btn" data-tab="criticals">Críticas (${criticals.length})</button>
+      <button class="tab-btn sp-tab" data-tab="services">★ Serviços SP (${spServices.length}/${totalServices})</button>
       <button class="tab-btn" data-tab="suggestions">Sugestões (${suggestions.length})</button>
       <button class="tab-btn" data-tab="textreport">Relatório Texto</button>
     </div>
@@ -142,6 +149,13 @@ function renderPage(container, session, status) {
           ? renderCallTable(criticals)
           : '<p style="color:var(--muted);padding:20px 0">Nenhuma chamada crítica nesta sessão.</p>'
         }
+      </div>
+    </div>
+
+    <!-- Tab: Serviços SP -->
+    <div class="tab-panel" id="tab-services">
+      <div class="section">
+        ${renderServiceMap(spServices, otherServices)}
       </div>
     </div>
 
@@ -373,6 +387,93 @@ function buildDetailContent(req) {
       ${payloadSection}
       ${responseSection}
     </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// Mapa de serviços SP
+// ---------------------------------------------------------------------------
+
+/**
+ * Renderiza o painel "Serviços SP" da página de relatório.
+ *
+ * SP services aparecem em destaque no topo (fundo diferenciado, badge ★).
+ * Os demais serviços ficam abaixo em tabela compacta.
+ *
+ * @param {Object[]} spServices    entradas SP do getServiceMap
+ * @param {Object[]} otherServices demais entradas do getServiceMap
+ * @returns {string}  HTML
+ */
+function renderServiceMap(spServices, otherServices) {
+  if (!spServices.length && !otherServices.length) {
+    return '<p style="color:var(--muted);padding:20px 0">Nenhum serviço identificado nesta sessão.</p>';
+  }
+
+  let html = '';
+
+  // ── Serviços SP em destaque ────────────────────────────────────────────
+  if (spServices.length) {
+    html += `<h3 style="color:#f59e0b;margin:0 0 12px">★ Serviços SP — Classe de Origem (${spServices.length})</h3>`;
+    html += '<div class="sp-cards">';
+    for (const e of spServices) {
+      const apps  = [...e.applications].join(', ') || '—';
+      const cats  = [...e.categories].join(' · ')  || '—';
+      const critBadge = e.hasCritical   ? '<span class="cat-badge critical">⚠ CRÍTICO</span>' : '';
+      const botBadge  = e.hasBottleneck ? '<span class="cat-badge bottleneck">⚡ GARGALO</span>' : '';
+      html += `
+        <div class="sp-card">
+          <div class="sp-card-header">
+            <span class="sp-badge">★ SP</span>
+            <strong>${escHtml(e.serviceName)}</strong>
+            ${critBadge}${botBadge}
+          </div>
+          <ul class="kv-list">
+            <li><span class="k">Classe SP</span><span class="v">${escHtml(e.spClass)}</span></li>
+            <li><span class="k">Método</span><span class="v">${escHtml(e.method)}</span></li>
+            <li><span class="k">Classe origem</span><span class="v">${escHtml(apps)}</span></li>
+            <li><span class="k">Categoria</span><span class="v">${escHtml(cats)}</span></li>
+            <li><span class="k">Chamadas</span><span class="v">${e.callCount}</span></li>
+            <li><span class="k">Tempo máx</span><span class="v">${fmtDuration(e.maxDuration)}</span></li>
+            <li><span class="k">Tempo total</span><span class="v">${fmtDuration(e.totalDuration)}</span></li>
+          </ul>
+        </div>`;
+    }
+    html += '</div>';
+  }
+
+  // ── Demais serviços em tabela ──────────────────────────────────────────
+  if (otherServices.length) {
+    html += `<h3 style="margin:24px 0 12px;color:var(--muted)">Demais serviços (${otherServices.length})</h3>`;
+    html += `
+      <table class="call-table">
+        <thead>
+          <tr>
+            <th>serviceName</th>
+            <th>Classe origem</th>
+            <th>Categoria</th>
+            <th>Chamadas</th>
+            <th>Tempo máx</th>
+            <th>Flags</th>
+          </tr>
+        </thead>
+        <tbody>`;
+    for (const e of otherServices) {
+      const apps  = [...e.applications].join(', ') || '—';
+      const cats  = [...e.categories].join(' · ')  || '—';
+      const flags = [e.hasCritical ? '⚠' : '', e.hasBottleneck ? '⚡' : ''].filter(Boolean).join(' ') || '—';
+      html += `
+          <tr>
+            <td>${escHtml(e.serviceName)}</td>
+            <td>${escHtml(apps)}</td>
+            <td>${escHtml(cats)}</td>
+            <td>${e.callCount}</td>
+            <td>${fmtDuration(e.maxDuration)}</td>
+            <td>${escHtml(flags)}</td>
+          </tr>`;
+    }
+    html += '</tbody></table>';
+  }
+
+  return html;
 }
 
 // ---------------------------------------------------------------------------

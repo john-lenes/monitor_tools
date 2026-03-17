@@ -25,6 +25,23 @@
 import { CATEGORIES } from './classifier.js';
 
 // ---------------------------------------------------------------------------
+// Helper interno — extração de serviceName
+// ---------------------------------------------------------------------------
+
+/**
+ * Extrai o serviceName de uma requisição, verificando queryParams e businessFields.
+ * Centralizado aqui para evitar repetição em getServiceMap, generateSuggestions
+ * e generateTextReport.
+ *
+ * @param {Object} req  requisição normalizada
+ * @returns {string|null}
+ */
+function extractServiceName(req) {
+  const bf = req.parsedPayload?.businessFields ?? {};
+  return req.queryParams?.serviceName ?? bf.serviceName ?? bf.servicename ?? null;
+}
+
+// ---------------------------------------------------------------------------
 // Estatísticas da sessão
 // ---------------------------------------------------------------------------
 
@@ -69,7 +86,14 @@ export function getSessionStats(requests = []) {
     byCategory[cat] = (byCategory[cat] || 0) + 1;
   }
 
-  return { total: requests.length, relevant: relevant.length, critical: critical.length, bottlenecks: bottlenecks.length, maxDuration, avgDuration, byCategory };
+  // Contagem de serviços SP únicos (classe cujo nome termina com SP)
+  const spServices = relevant.filter((r) => {
+    const sn = extractServiceName(r);
+    return sn && /\bSP\./i.test(sn);
+  });
+  const spCount = new Set(spServices.map((r) => extractServiceName(r))).size;
+
+  return { total: requests.length, relevant: relevant.length, critical: critical.length, bottlenecks: bottlenecks.length, spCount, maxDuration, avgDuration, byCategory };
 }
 
 // ---------------------------------------------------------------------------
@@ -113,8 +137,8 @@ export function generateSuggestions(requests = []) {
 
     const bf = parsedPayload?.businessFields ?? {};
 
-    // serviceName
-    const sn = queryParams?.serviceName ?? bf.serviceName ?? bf.servicename;
+    // serviceName — usa o helper centralizado
+    const sn = extractServiceName(req);
     if (sn && !seen.serviceNames.has(sn)) {
       seen.serviceNames.add(sn);
       suggestions.add(`Procurar por "${sn}" no backend`);
@@ -125,6 +149,21 @@ export function generateSuggestions(requests = []) {
     if (app && !seen.applications.has(app)) {
       seen.applications.add(app);
       suggestions.add(`Verificar classe/bean "${app}"`);
+    }
+
+    // Sugestões específicas para classes SP
+    // Quando o serviceName pertence a uma classe SP, sugere inspecionar
+    // a classe e a sua relação com a classe de origem (application).
+    if (sn && /\bSP\./i.test(sn)) {
+      const spClass = sn.split('.')[0];
+      const spKey   = `SP:${spClass}`;
+      if (!seen.serviceNames.has(spKey)) {
+        seen.serviceNames.add(spKey);
+        suggestions.add(`Inspecionar classe SP "${spClass}" — verificar implementação e parâmetros`);
+        if (app && app !== 'workspace') {
+          suggestions.add(`Verificar classe de origem "${app}" vinculada ao SP "${spClass}"`);
+        }
+      }
     }
 
     // resourceID
@@ -176,6 +215,71 @@ export function generateSuggestions(requests = []) {
   }
 
   return [...suggestions];
+}
+
+// ---------------------------------------------------------------------------
+// Mapa de serviços únicos
+// ---------------------------------------------------------------------------
+
+/**
+ * Constrói o mapa consolidado de TODOS os serviços únicos executados na sessão.
+ * Agrega múltiplas chamadas para o mesmo serviceName numa única entrada.
+ *
+ * Serviços cuja classe termina com "SP" (padrão Sankhya para Service Providers)
+ * são separados em `spServices` e sempre listados em destaque. Os demais ficam
+ * em `otherServices`. Ambos os arrays são ordenados por tempo máximo (desc).
+ *
+ * @param {Object[]} requests  lista de requisições normalizadas
+ * @returns {{
+ *   spServices:    Object[],  chamadas de classes SP, destacadas
+ *   otherServices: Object[],  demais chamadas relevantes com serviceName
+ * }}
+ */
+export function getServiceMap(requests = []) {
+  const map = new Map(); // serviceName → entry agregada
+
+  for (const req of requests) {
+    if (req.classification?.category === CATEGORIES.IRRELEVANT) continue;
+
+    const sn = extractServiceName(req);
+    if (!sn) continue;
+
+    if (!map.has(sn)) {
+      const isSP = /\bSP\./i.test(sn);
+      map.set(sn, {
+        serviceName:   sn,
+        isSP,
+        spClass:       isSP ? sn.split('.')[0] : null,
+        method:        sn.includes('.') ? sn.split('.').slice(1).join('.') : sn,
+        applications:  new Set(),
+        categories:    new Set(),
+        callCount:     0,
+        maxDuration:   0,
+        totalDuration: 0,
+        hasCritical:   false,
+        hasBottleneck: false,
+      });
+    }
+
+    const entry = map.get(sn);
+    entry.callCount++;
+    entry.totalDuration += req.duration || 0;
+    entry.maxDuration = Math.max(entry.maxDuration, req.duration || 0);
+    if (req.classification?.isCritical)   entry.hasCritical  = true;
+    if (req.classification?.isBottleneck) entry.hasBottleneck = true;
+
+    const app = req.queryParams?.application ?? req.parsedPayload?.businessFields?.application;
+    if (app) entry.applications.add(app);
+
+    const cat = req.classification?.category;
+    if (cat && cat !== CATEGORIES.IRRELEVANT) entry.categories.add(cat);
+  }
+
+  const entries = [...map.values()];
+  return {
+    spServices:    entries.filter((e) =>  e.isSP).sort((a, b) => b.maxDuration - a.maxDuration),
+    otherServices: entries.filter((e) => !e.isSP).sort((a, b) => b.maxDuration - a.maxDuration),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -245,7 +349,7 @@ export function generateTextReport(session) {
 
     relevant.forEach((req, i) => {
       const bf  = req.parsedPayload?.businessFields ?? {};
-      const sn  = req.queryParams?.serviceName ?? bf.serviceName ?? bf.servicename ?? '—';
+    const sn  = extractServiceName(req) ?? '—';
       const app = req.queryParams?.application ?? bf.application ?? '';
       const cat = req.classification?.category ?? '—';
       const bot = req.classification?.isBottleneck ? ' + GARGALO' : '';
@@ -268,6 +372,53 @@ export function generateTextReport(session) {
     lines.push('');
   }
 
+  // Mapa completo de todos os serviços executados
+  // SP services are highlighted first; all others listed after.
+  const { spServices, otherServices } = getServiceMap(requests);
+
+  if (spServices.length + otherServices.length > 0) {
+    lines.push(LINE_LIGHT);
+    lines.push('MAPA DE SERVIÇOS EXECUTADOS');
+    lines.push(LINE_LIGHT);
+    lines.push('');
+
+    // ── Serviços SP em destaque ──────────────────────────────────────────
+    if (spServices.length) {
+      lines.push(`  ★ SERVIÇOS SP (${spServices.length}) — vinculados à classe de origem`);
+      lines.push('  ' + '-'.repeat(50));
+      lines.push('');
+      for (const e of spServices) {
+        const apps  = [...e.applications].join(', ') || '—';
+        const cats  = [...e.categories].join(' | ')  || '—';
+        const flags = [e.hasCritical ? '⚠ CRÍTICO' : '', e.hasBottleneck ? '⚡ GARGALO' : ''].filter(Boolean).join('  ');
+        lines.push(`  [★ SP] ${e.serviceName}`);
+        lines.push(`         Classe SP     : ${e.spClass}`);
+        lines.push(`         Método        : ${e.method}`);
+        lines.push(`         Classe origem : ${apps}`);
+        lines.push(`         Categoria     : ${cats}`);
+        lines.push(`         Chamadas      : ${e.callCount}  |  Tempo máx: ${fmt(e.maxDuration)}  |  Total: ${fmt(e.totalDuration)}`);
+        if (flags) lines.push(`         ${flags}`);
+        lines.push('');
+      }
+    }
+
+    // ── Demais serviços ──────────────────────────────────────────────────
+    if (otherServices.length) {
+      lines.push(`  Demais serviços (${otherServices.length}):`);
+      lines.push('  ' + '-'.repeat(50));
+      lines.push('');
+      for (const e of otherServices) {
+        const apps  = [...e.applications].join(', ') || '—';
+        const cats  = [...e.categories].join(' | ')  || '—';
+        const flags = [e.hasCritical ? '⚠' : '', e.hasBottleneck ? '⚡' : ''].filter(Boolean).join(' ');
+        lines.push(`  [ ] ${e.serviceName}`);
+        lines.push(`      Classe origem : ${apps}`);
+        lines.push(`      Categoria     : ${cats}  |  Chamadas: ${e.callCount}  |  Tempo máx: ${fmt(e.maxDuration)}${flags ? '  ' + flags : ''}`);
+        lines.push('');
+      }
+    }
+  }
+
   // Seção de críticos com detalhes do erro
   const criticals = requests.filter((r) => r.classification?.isCritical);
   if (criticals.length) {
@@ -276,7 +427,7 @@ export function generateTextReport(session) {
     lines.push(LINE_LIGHT);
 
     criticals.forEach((req, i) => {
-      const sn = req.queryParams?.serviceName ?? '—';
+      const sn = extractServiceName(req) ?? '—';
       lines.push('');
       lines.push(`${String(i + 1).padStart(2)}. ${req.method} ${req.url}`);
       lines.push(`    serviceName : ${sn}`);
@@ -301,7 +452,7 @@ export function generateTextReport(session) {
   }
 
   lines.push(LINE_FULL);
-  lines.push('  Gerado por Sankhya Monitor — github.com/sankhya-monitor');
+  lines.push('  Gerado por Sankhya Monitor — https://github.com/john-lenes/monitor_tools.git');
   lines.push(LINE_FULL);
 
   return lines.join('\n');
