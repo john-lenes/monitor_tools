@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sankhya Monitor</title>
+  <style>
+    /* ── Reset & base ─────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #1e1e2e;
+      --surface:   #2a2a3d;
+      --border:    #3a3a55;
+      --accent:    #7c6af7;
+      --accent2:   #56cfbf;
+      --danger:    #f2637e;
+      --warn:      #f9a825;
+      --success:   #56cf88;
+      --muted:     #8888aa;
+      --text:      #e0e0f5;
+      --text-dim:  #a0a0c0;
+      --radius:    6px;
+      --font:      'Segoe UI', system-ui, sans-serif;
+    }
+
+    body {
+      width: 440px;
+      min-height: 200px;
+      max-height: 600px;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 13px;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ───────────────────────────────────────────── */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 14px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    header h1 {
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: .4px;
+      color: var(--accent);
+    }
+    #status-badge {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 3px 9px;
+      border-radius: 20px;
+      text-transform: uppercase;
+      letter-spacing: .5px;
+    }
+    #status-badge.idle       { background: #2d2d44; color: var(--muted); }
+    #status-badge.monitoring { background: #1a3a2a; color: var(--success); animation: pulse 1.8s infinite; }
+    #status-badge.finished   { background: #1a2444; color: var(--accent2); }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: .6; }
+    }
+
+    /* ── Session controls ─────────────────────────────────── */
+    .controls {
+      padding: 10px 14px 8px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .session-row {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 8px;
+      align-items: center;
+    }
+    #session-name {
+      flex: 1;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      padding: 5px 9px;
+      font-size: 12px;
+      outline: none;
+    }
+    #session-name:focus { border-color: var(--accent); }
+    #session-name::placeholder { color: var(--muted); }
+
+    .btn-row {
+      display: flex;
+      gap: 7px;
+    }
+    button {
+      cursor: pointer;
+      border: none;
+      border-radius: var(--radius);
+      font-size: 12px;
+      font-weight: 600;
+      padding: 6px 14px;
+      transition: filter .15s, opacity .15s;
+    }
+    button:disabled { opacity: .4; cursor: default; }
+    button:not(:disabled):hover { filter: brightness(1.15); }
+
+    #btn-start  { background: var(--success); color: #001a0e; }
+    #btn-stop   { background: var(--danger);  color: #fff; }
+    #btn-clear  { background: var(--border);  color: var(--text-dim); }
+    #btn-report { background: var(--accent);  color: #fff; margin-left: auto; }
+
+    /* ── Botão de ajuda (?) ────────────────── */
+    #btn-help {
+      background: transparent;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      border-radius: 50%;
+      width: 22px;
+      height: 22px;
+      padding: 0;
+      font-size: 13px;
+      font-weight: 700;
+      line-height: 20px;
+      text-align: center;
+      flex-shrink: 0;
+      transition: color .15s, border-color .15s;
+    }
+    #btn-help:hover {
+      color: var(--accent);
+      border-color: var(--accent);
+      filter: none;
+    }
+    #btn-help.active {
+      color: var(--accent);
+      border-color: var(--accent);
+      background: rgba(124,106,247,.08);
+    }
+
+    /* ── Painel de instruções de uso ──────── */
+    .help-panel {
+      background: var(--surface);
+      border-bottom: 2px solid var(--accent);
+      overflow-y: auto;
+      max-height: 310px;
+      flex-shrink: 0;
+    }
+    .help-panel::-webkit-scrollbar { width: 4px; }
+    .help-panel::-webkit-scrollbar-track { background: var(--surface); }
+    .help-panel::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    .help-section {
+      padding: 10px 14px 8px;
+      border-bottom: 1px solid var(--border);
+    }
+    .help-section:last-child { border-bottom: none; }
+    .help-section h3 {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .5px;
+      color: var(--accent);
+      margin-bottom: 7px;
+    }
+    .help-steps {
+      list-style: none;
+      counter-reset: step-counter;
+    }
+    .help-steps li {
+      counter-increment: step-counter;
+      position: relative;
+      padding-left: 22px;
+      font-size: 12px;
+      color: var(--text-dim);
+      margin-bottom: 5px;
+      line-height: 1.5;
+    }
+    .help-steps li::before {
+      content: counter(step-counter);
+      position: absolute;
+      left: 0;
+      top: 0;
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--accent);
+      background: rgba(124,106,247,.12);
+      border-radius: 50%;
+      width: 16px;
+      height: 16px;
+      line-height: 16px;
+      text-align: center;
+    }
+    .help-steps li strong { color: var(--text); }
+    .help-categories {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 4px 10px;
+    }
+    .help-cat-item {
+      font-size: 11px;
+      color: var(--text-dim);
+      padding: 2px 0;
+    }
+    .help-cat-item .badge {
+      display: inline-block;
+      font-size: 9px;
+      font-weight: 700;
+      padding: 1px 5px;
+      border-radius: 3px;
+      margin-right: 4px;
+      vertical-align: middle;
+    }
+    .badge-config    { background:#1e3050; color:#5eb8ff; }
+    .badge-query     { background:#1a3535; color:var(--accent2); }
+    .badge-persist   { background:#2a2048; color:#a78bf8; }
+    .badge-biz       { background:#2a1e38; color:#e08af8; }
+    .badge-bottle    { background:#3a2a08; color:var(--warn); }
+    .badge-critical  { background:#3a0f1c; color:var(--danger); }
+    .badge-support   { background:#252535; color:var(--muted); }
+    .badge-irrel     { background:#1e1e2e; color:#555570; }
+    .help-tips {
+      list-style: none;
+    }
+    .help-tips li {
+      font-size: 11px;
+      color: var(--text-dim);
+      padding: 2px 0 2px 14px;
+      position: relative;
+    }
+    .help-tips li::before {
+      content: '→';
+      position: absolute;
+      left: 0;
+      color: var(--muted);
+    }
+
+    /* ── Stats cards ─────────────────────────────────────── */
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1px;
+      background: var(--border);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .stat-card {
+      background: var(--bg);
+      text-align: center;
+      padding: 8px 4px;
+    }
+    .stat-card .val {
+      font-size: 18px;
+      font-weight: 700;
+      display: block;
+      line-height: 1.1;
+    }
+    .stat-card .lbl {
+      font-size: 10px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .3px;
+      margin-top: 2px;
+    }
+    #stat-total     .val { color: var(--text); }
+    #stat-relevant  .val { color: var(--accent2); }
+    #stat-critical  .val { color: var(--danger); }
+    #stat-maxtime   .val { color: var(--warn); }
+
+    /* ── Call list ───────────────────────────────────────── */
+    .list-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 7px 14px 5px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .list-header span {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .4px;
+    }
+    #filter-toggle {
+      font-size: 11px;
+      color: var(--accent);
+      cursor: pointer;
+      background: none;
+      border: none;
+      padding: 0;
+      font-weight: 600;
+    }
+
+    #call-list {
+      flex: 1;
+      overflow-y: auto;
+      overflow-x: hidden;
+      min-height: 0;
+    }
+    #call-list::-webkit-scrollbar { width: 5px; }
+    #call-list::-webkit-scrollbar-track { background: var(--bg); }
+    #call-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    .call-item {
+      padding: 7px 14px;
+      border-bottom: 1px solid var(--border);
+      cursor: pointer;
+      transition: background .1s;
+      display: grid;
+      grid-template-columns: 42px 1fr auto;
+      gap: 6px;
+      align-items: start;
+    }
+    .call-item:hover { background: var(--surface); }
+    .call-item.selected { background: #2a2244; border-left: 3px solid var(--accent); padding-left: 11px; }
+    .call-item.critical { border-left: 3px solid var(--danger); padding-left: 11px; }
+    .call-item.critical.selected { background: #2a1f24; }
+
+    .method-badge {
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 5px;
+      border-radius: 3px;
+      text-align: center;
+      align-self: start;
+      margin-top: 1px;
+    }
+    .method-badge.POST   { background: #1a3350; color: #5eb8ff; }
+    .method-badge.GET    { background: #1a3a1a; color: var(--success); }
+    .method-badge.PUT    { background: #3a2a10; color: var(--warn); }
+    .method-badge.DELETE { background: #3a1020; color: var(--danger); }
+    .method-badge.OTHER  { background: var(--border); color: var(--muted); }
+
+    .call-info { min-width: 0; }
+    .call-service {
+      font-size: 12px;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: var(--text);
+    }
+    .call-url {
+      font-size: 10px;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-top: 1px;
+    }
+    .call-right {
+      text-align: right;
+      flex-shrink: 0;
+    }
+    .call-time {
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .call-time.slow   { color: var(--warn); }
+    .call-time.fast   { color: var(--text-dim); }
+    .call-time.medium { color: var(--accent2); }
+    .call-cat {
+      font-size: 9px;
+      color: var(--muted);
+      text-transform: uppercase;
+      margin-top: 2px;
+      max-width: 80px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .tag-critical { color: var(--danger) !important; font-weight: 700; }
+    .tag-bottleneck { color: var(--warn) !important; }
+
+    /* ── Empty / loading states ──────────────────────────── */
+    .empty-state {
+      padding: 30px 20px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.7;
+    }
+    .empty-state strong { color: var(--text-dim); display: block; margin-bottom: 6px; font-size: 13px; }
+
+    /* ── Detail panel ────────────────────────────────────── */
+    #detail-panel {
+      border-top: 2px solid var(--accent);
+      background: var(--surface);
+      padding: 10px 14px;
+      flex-shrink: 0;
+      display: none;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+    #detail-panel.visible { display: block; }
+    #detail-panel::-webkit-scrollbar { width: 5px; }
+    #detail-panel::-webkit-scrollbar-track { background: var(--surface); }
+    #detail-panel::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    .detail-close {
+      float: right;
+      background: none;
+      border: none;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 14px;
+      padding: 0;
+      line-height: 1;
+    }
+    .detail-close:hover { color: var(--danger); }
+    .detail-title {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--accent);
+      margin-bottom: 8px;
+    }
+    .detail-grid {
+      display: grid;
+      grid-template-columns: 110px 1fr;
+      gap: 3px 8px;
+      font-size: 11px;
+    }
+    .detail-grid .dk { color: var(--muted); }
+    .detail-grid .dv {
+      color: var(--text);
+      word-break: break-all;
+      max-height: 36px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .detail-grid .dv.expandable { cursor: pointer; }
+    .detail-grid .dv.expandable:hover { color: var(--accent); }
+
+    .detail-section {
+      margin-top: 8px;
+      padding-top: 6px;
+      border-top: 1px solid var(--border);
+    }
+    .detail-section-title {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      color: var(--muted);
+      letter-spacing: .4px;
+      margin-bottom: 4px;
+    }
+    .suggestion-list { list-style: none; }
+    .suggestion-list li {
+      font-size: 11px;
+      color: var(--accent2);
+      padding: 1px 0;
+    }
+    .suggestion-list li::before { content: '→ '; color: var(--muted); }
+
+    /* ── Footer ─────────────────────────────────────────── */
+    footer {
+      display: flex;
+      gap: 7px;
+      padding: 8px 14px;
+      border-top: 1px solid var(--border);
+      background: var(--surface);
+      flex-shrink: 0;
+    }
+    #btn-report { flex: 1; }
+    #btn-export-json, #btn-export-txt {
+      background: var(--border);
+      color: var(--text-dim);
+      font-size: 11px;
+      padding: 6px 10px;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <header>
+    <h1>⬡ Sankhya Monitor</h1>
+    <button id="btn-help" title="Como usar a ferramenta">?</button>
+    <span id="status-badge" class="idle">Inativo</span>
+  </header>
+
+  <!-- Painel de instruções de uso (mostrado/ocultado pelo botão ?) -->
+  <div id="help-panel" class="help-panel" style="display:none" aria-label="Instruções de uso">
+
+    <div class="help-section">
+      <h3>Como usar</h3>
+      <ol class="help-steps">
+        <li>Abra o <strong>Sankhya ERP</strong> na aba desejada do Chrome.</li>
+        <li><strong>Nomeie a sessão</strong> (ex: “Inclução de NF”) e clique <strong>▶ Iniciar</strong>.</li>
+        <li>Execute a <strong>ação que deseja analisar</strong> no Sankhya — todas as chamadas HTTP serão capturadas.</li>
+        <li>Clique <strong>■ Finalizar</strong> para encerrar a captura após a ação.</li>
+        <li>Clique <strong>📋 Ver Relatório Completo</strong> para ver análise detalhada, sugestões e exportações.</li>
+      </ol>
+    </div>
+
+    <div class="help-section">
+      <h3>Categorias de Chamada</h3>
+      <div class="help-categories">
+        <div class="help-cat-item">
+          <span class="badge badge-config">CONFIG</span>Preferências e parâmetros
+        </div>
+        <div class="help-cat-item">
+          <span class="badge badge-query">CONSULTA</span>Carregamento de dados
+        </div>
+        <div class="help-cat-item">
+          <span class="badge badge-persist">PERSIST</span>Gravação e alteração
+        </div>
+        <div class="help-cat-item">
+          <span class="badge badge-biz">REGRA</span>Ações e eventos de negócio
+        </div>
+        <div class="help-cat-item">
+          <span class="badge badge-bottle">GARGALO</span>Lento (&gt; 2 segundos)
+        </div>
+        <div class="help-cat-item">
+          <span class="badge badge-critical">CRÍTICO</span>Erro HTTP ou exceção
+        </div>
+        <div class="help-cat-item">
+          <span class="badge badge-support">APOIO</span>Sem serviço identificado
+        </div>
+        <div class="help-cat-item">
+          <span class="badge badge-irrel">IRREL.</span>Asset / polling — ignorado
+        </div>
+      </div>
+    </div>
+
+    <div class="help-section">
+      <h3>Dicas</h3>
+      <ul class="help-tips">
+        <li>Nomeie a sessão com a ação testada para identificar relatórios exportados.</li>
+        <li>Use “Apenas Prioritárias” para focar em gargalos e erros críticos.</li>
+        <li>Abra o DevTools do Chrome para captura mais precisa do corpo da resposta.</li>
+        <li>Exporte o <strong>TXT</strong> para compartilhar com o time de backend.</li>
+      </ul>
+    </div>
+
+  </div>
+
+  <!-- Controls -->
+  <div class="controls">
+    <div class="session-row">
+      <input id="session-name" type="text" maxlength="60"
+             placeholder="Nome da sessão (ex: Registro de Produção)" />
+    </div>
+    <div class="btn-row">
+      <button id="btn-start">▶ Iniciar</button>
+      <button id="btn-stop"  disabled>■ Finalizar</button>
+      <button id="btn-clear" disabled>↺ Limpar</button>
+    </div>
+  </div>
+
+  <!-- Stats -->
+  <div class="stats">
+    <div class="stat-card" id="stat-total">
+      <span class="val" id="v-total">—</span>
+      <span class="lbl">Total</span>
+    </div>
+    <div class="stat-card" id="stat-relevant">
+      <span class="val" id="v-relevant">—</span>
+      <span class="lbl">Relevantes</span>
+    </div>
+    <div class="stat-card" id="stat-critical">
+      <span class="val" id="v-critical">—</span>
+      <span class="lbl">Críticas</span>
+    </div>
+    <div class="stat-card" id="stat-maxtime">
+      <span class="val" id="v-maxtime">—</span>
+      <span class="lbl">T. Máx.</span>
+    </div>
+  </div>
+
+  <!-- Call list header -->
+  <div class="list-header">
+    <span>Chamadas Capturadas</span>
+    <button id="filter-toggle">Apenas Prioritárias</button>
+  </div>
+
+  <!-- Call list -->
+  <div id="call-list">
+    <div class="empty-state">
+      <strong>Nenhuma chamada capturada</strong>
+      Inicie uma sessão e execute uma ação no Sankhya.
+    </div>
+  </div>
+
+  <!-- Detail panel (expandable) -->
+  <div id="detail-panel">
+    <button class="detail-close" id="detail-close">✕</button>
+    <div class="detail-title" id="detail-title"></div>
+    <div class="detail-grid" id="detail-grid"></div>
+    <div class="detail-section" id="detail-suggestions" style="display:none">
+      <div class="detail-section-title">Sugestões backend</div>
+      <ul class="suggestion-list" id="suggestion-list"></ul>
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <footer>
+    <button id="btn-report" disabled>📋 Ver Relatório Completo</button>
+    <button id="btn-export-json" disabled>⬇ JSON</button>
+    <button id="btn-export-txt"  disabled>⬇ TXT</button>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>

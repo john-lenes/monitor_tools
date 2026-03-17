@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <title>Sankhya Monitor DevTools</title>
+</head>
+<body>
+  <!--
+    Esta página é a "devtools_page" declarada no manifest.json.
+    Ela não possui UI própria; sua única função é registrar o listener de rede
+    do DevTools e publicar os dados capturados para o background.js.
+
+    Funciona como fonte SECUNDÁRIA de captura (complementa o content-main.js),
+    capturando dados mais completos (headers, response body) quando o painel
+    DevTools estiver aberto.
+  -->
+  <script src="devtools.js"></script>
+</body>
+</html>

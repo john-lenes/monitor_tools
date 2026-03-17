@@ -1,0 +1,52 @@
+{
+  "manifest_version": 3,
+  "name": "Sankhya Monitor",
+  "version": "1.0.0",
+  "description": "Monitora, captura e classifica chamadas HTTP do Sankhya durante ações do usuário.",
+
+  "permissions": [
+    "activeTab",
+    "storage",
+    "scripting",
+    "tabs"
+  ],
+
+  "host_permissions": [
+    "<all_urls>"
+  ],
+
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Sankhya Monitor"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content-main.js"],
+      "world": "MAIN",
+      "run_at": "document_start",
+      "all_frames": false
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content-bridge.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ],
+
+  "web_accessible_resources": [
+    {
+      "resources": ["report.html"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+
+  "devtools_page": "devtools.html"
+}
