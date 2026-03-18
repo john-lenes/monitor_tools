@@ -184,6 +184,26 @@ async function processAndStore(raw, source) {
   // [Passo 9] Classificar — determina categoria funcional, criticidade e gargalos
   normalized.classification = classifyRequest(normalized);
 
+  // [Passo 9.5] Cap de armazenamento para chamadas repetitivas não-essenciais.
+  // SP, críticos e gargalos são SEMPRE armazenados (cada execução é única).
+  // Demais chamadas com o mesmo serviceName ficam limitadas a MAX_REPEATED por sessão
+  // para evitar que sessões longas saturem o storage com centenas do mesmo serviço.
+  const MAX_REPEATED = 10;
+  const _sn =
+    normalized.queryParams?.serviceName ??
+    normalized.parsedPayload?.businessFields?.serviceName ??
+    normalized.parsedPayload?.businessFields?.servicename;
+  const _isSP = _sn && /\bSP\./i.test(_sn);
+  if (!_isSP && !normalized.classification.isCritical && !normalized.classification.isBottleneck && _sn) {
+    const sameCount = (session.requests || []).filter((r) => {
+      const rsn = r.queryParams?.serviceName
+                ?? r.parsedPayload?.businessFields?.serviceName
+                ?? r.parsedPayload?.businessFields?.servicename;
+      return rsn === _sn;
+    }).length;
+    if (sameCount >= MAX_REPEATED) return; // excesso descartado — dado já representado
+  }
+
   // [Passo 10] Persistir e notificar o popup
   session.requests = session.requests || [];
   session.requests.push(normalized);

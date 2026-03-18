@@ -310,6 +310,68 @@ export function getServiceMap(requests = []) {
 }
 
 // ---------------------------------------------------------------------------
+// Filtragem essencial para exibição
+// ---------------------------------------------------------------------------
+
+/**
+ * Filtra chamadas para exibição, retendo apenas o ESSENCIAL:
+ *
+ * SEMPRE inclui (todas as ocorrências individuais):
+ *  • Chamadas SP   — cada execução é única e diagnosticamente significativa
+ *  • Chamadas Críticas — erros, HTTP 5xx, exceções Java/Oracle
+ *  • Chamadas Gargalo  — duração > 2 segundos
+ *
+ * DEDUPLICA (exibe apenas a mais representativa por grupo):
+ *  • Demais chamadas com serviceName — uma por serviceName, a de maior duração
+ *  • Chamadas sem serviceName        — uma por pathname de URL, a de maior duração
+ *
+ * IRRELEVANTES (assets estáticos, polling) são sempre excluídas.
+ *
+ * @param {Object[]} requests  todas as chamadas da sessão
+ * @returns {Object[]}  lista filtrada, ordenada por duração descendente
+ */
+export function filterEssential(requests = []) {
+  const always     = [];  // SP + críticos + gargalos: cada ocorrência individual
+  const bestBySN   = new Map(); // serviceName → chamada de maior duração
+  const bestByPath = new Map(); // pathname    → chamada de maior duração (sem SN)
+
+  for (const req of requests) {
+    const cat   = req.classification?.category;
+    if (cat === CATEGORIES.IRRELEVANT) continue;
+
+    const sn    = extractServiceName(req);
+    const isSP  = sn && /\bSP\./i.test(sn);
+    const isCrit = req.classification?.isCritical;
+    const isBot  = req.classification?.isBottleneck;
+
+    // SP, críticos e gargalos: todas as ocorrências individualmente
+    if (isSP || isCrit || isBot) {
+      always.push(req);
+      continue;
+    }
+
+    // Demais com serviceName: guarda apenas a de maior duração por serviceName
+    if (sn) {
+      const cur = bestBySN.get(sn);
+      if (!cur || (req.duration || 0) > (cur.duration || 0)) bestBySN.set(sn, req);
+      continue;
+    }
+
+    // Sem serviceName: guarda apenas a de maior duração por pathname
+    let path = req.url;
+    try { path = new URL(req.url).pathname; } catch (_) {}
+    const cur = bestByPath.get(path);
+    if (!cur || (req.duration || 0) > (cur.duration || 0)) bestByPath.set(path, req);
+  }
+
+  return [
+    ...always,
+    ...bestBySN.values(),
+    ...bestByPath.values(),
+  ].sort((a, b) => (b.duration || 0) - (a.duration || 0));
+}
+
+// ---------------------------------------------------------------------------
 // Geração do relatório em texto plano
 // ---------------------------------------------------------------------------
 
@@ -385,14 +447,16 @@ export function generateTextReport(session) {
     lines.push('');
   }
 
-  // Chamadas relevantes ordenadas por tempo
-  const relevant = [...requests]
-    .filter((r) => r.classification?.category !== CATEGORIES.IRRELEVANT)
-    .sort((a, b) => (b.duration || 0) - (a.duration || 0));
+  // Chamadas essenciais: SP todas, críticos/gargalos todos, demais 1 por serviceName
+  const relevant     = filterEssential(requests);
+  const totalRelev   = requests.filter((r) => r.classification?.category !== CATEGORIES.IRRELEVANT).length;
+  const dedupedLabel = totalRelev > relevant.length
+    ? ` (${relevant.length} de ${totalRelev} — ${totalRelev - relevant.length} redundantes suprimidas)`
+    : ` (${relevant.length})`;
 
   if (relevant.length) {
     lines.push(LINE_LIGHT);
-    lines.push('CHAMADAS RELEVANTES (por tempo de resposta)');
+    lines.push(`CHAMADAS ESSENCIAIS${dedupedLabel}`);
     lines.push(LINE_LIGHT);
 
     relevant.forEach((req, i) => {

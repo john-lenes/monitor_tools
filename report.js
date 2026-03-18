@@ -19,7 +19,7 @@
  *  NÃO depende de popup.js — carrega dados do background diretamente.
  */
 
-import { generateTextReport, generateSuggestions, getSessionStats, getServiceMap } from './modules/reporter.js';
+import { generateTextReport, generateSuggestions, getSessionStats, getServiceMap, filterEssential } from './modules/reporter.js';
 
 // ---------------------------------------------------------------------------
 // Bootstrap
@@ -65,9 +65,12 @@ function renderPage(container, session, status) {
   const stats                       = getSessionStats(session.requests);
   const suggestions                 = generateSuggestions(session.requests);
   const { spServices, otherServices } = getServiceMap(session.requests);
-  const relevant    = session.requests
-    .filter((r) => r.classification?.category !== 'IRRELEVANTE')
-    .sort((a, b) => (b.duration || 0) - (a.duration || 0));
+  // filterEssential: SP todas, críticos/gargalos todos, demais 1 por serviceName (a mais lenta)
+  const relevant      = filterEssential(session.requests);
+  const totalRelev    = session.requests.filter((r) => r.classification?.category !== 'IRRELEVANTE').length;
+  const relevLabel    = totalRelev > relevant.length
+    ? `${relevant.length} de ${totalRelev}`
+    : String(relevant.length);
 
   const criticals = session.requests.filter((r) => r.classification?.isCritical);
   const totalServices = spServices.length + otherServices.length;
@@ -128,7 +131,7 @@ function renderPage(container, session, status) {
 
     <!-- Tabs -->
     <div class="tabs">
-      <button class="tab-btn active" data-tab="calls">Chamadas (${relevant.length})</button>
+      <button class="tab-btn active" data-tab="calls">Chamadas (${relevLabel})</button>
       <button class="tab-btn" data-tab="criticals">Críticas (${criticals.length})</button>
       <button class="tab-btn sp-tab" data-tab="services">★ Serviços SP (${spServices.length}/${totalServices})</button>
       <button class="tab-btn" data-tab="suggestions">Sugestões (${suggestions.length})</button>
