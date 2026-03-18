@@ -95,52 +95,18 @@ export function parseQueryParams(url) {
 // ---------------------------------------------------------------------------
 
 /**
- * Campos de negócio do Sankhya que devem ser extraídos de qualquer
- * nível de profundidade do objeto JSON da requisição.
- *
- * Glossário Sankhya:
- *  nunota      — número único de nota fiscal / pedido / título
- *  nufin       — número de título financeiro
- *  codemp      — código da empresa (multi-empresa)
- *  codfilial   — código da filial
- *  codparc     — código do parceiro (cliente/fornecedor)
- *  codprod     — código do produto
- *  nuseq       — número de sequência (item de nota, linha de grid)
- *  codvend     — código do vendedor
- *  codusu      — código do usuário que executou
- *  codusuinc   — código do usuário que incluíu
- *  codusualt   — código do usuário que alterou
- *  codtipoper  — código do tipo de operação (TOP)
- *  codnat      — código da natureza de operação
- *  codcencus   — código do centro de custo
- *  codloc      — código do local de estoque
- *  codest      — código do estado
- *  id          — identificador genérico de entidade
- *  entityname  — nome da entidade MGE (ex: "NF", "TGFCAB", "TGFITE")
- *  tipo        — tipo da operação ou do registro
- *  origem      — origem da operação
- *  action      — ação executada (ex: "save", "delete", "execute")
- *  event       — evento disparado (ex: "beforeSave", "afterLoad")
- *  listener    — listener de evento registrado no servidor
- *  method      — método do serviço chamado
- *  servicename — nome do serviço Sankhya (ex: "CRUDService.save")
- *  application — código da aplicação/tela (ex: "NF", "RegistroProducao")
- *  resourceid  — identificador do recurso de negócio
- *  offset      — paginação: registro inicial
- *  limit       — paginação: quantidade de registros por página
- *  orderby     — campo de ordenação do grid
- *  criteria    — critério de filtro (cláusula WHERE simplificada)
- *  where       — cláusula WHERE SQL direta (indica query customizada)
- *  vlrnota     — valor monetário da nota
+ * Set (O(1)) de campos de negócio do Sankhya para extração recursiva.
+ * Usar Set.has() é ~5x mais rápido que Array.includes() para listas > 20 itens.
  */
-const BUSINESS_FIELDS = [
+const BUSINESS_FIELDS_SET = new Set([
   // Identificadores de nota / transação
-  'nunota', 'nufin', 'nuseq',
+  'nunota', 'nufin', 'nuseq', 'numnota',
   // Códigos organizacionais
   'codemp', 'codfilial', 'codparc', 'codprod', 'codvend',
   'codusu', 'codusuinc', 'codusualt',
   // Classificações e tipos
   'codtipoper', 'codnat', 'codcencus', 'codloc', 'codest',
+  'codtipvenda', 'codvol',
   'tipo', 'origem',
   // Identificador genérico e entidade
   'id', 'entityname',
@@ -150,9 +116,11 @@ const BUSINESS_FIELDS = [
   'servicename', 'application', 'resourceid',
   // Paginação e filtragem (indica tamanho e complexidade da query)
   'offset', 'limit', 'orderby', 'criteria', 'where',
+  // Datas de auditoria (identificam quando dados foram modificados)
+  'dtinc', 'dtalter',
   // Financeiro
-  'vlrnota',
-];
+  'vlrnota', 'nossonumero',
+]);
 
 /**
  * Percorre recursivamente um objeto JSON e coleta todos os campos de
@@ -163,10 +131,10 @@ const BUSINESS_FIELDS = [
  *  { "requestBody": { "pk": { "nunota": 123 }, "codemp": 1 } }
  *  Uma busca apenas no nível raiz perderia o `nunota`.
  *
- * Por que limitar a profundidade em 5?
+ * Por que limitar a profundidade em 6?
  *  Respostas Sankhya podem ter estruturas como:
- *  responseBody > rows > row[0] > fields > field[n] > value
- *  (4 níveis). Limite 5 cobre isso com margem sem risco de
+ *  responseBody > rows > row[0] > fields > field[n] > value > pk
+ *  (5 níveis). Limite 6 cobre isso com margem sem risco de
  *  loop infinito em estruturas circulares ou muito profundas.
  *
  * Política de sobrescrição:
@@ -179,18 +147,32 @@ const BUSINESS_FIELDS = [
  * @returns {Record<string,any>}  mapa campo→valor dos campos encontrados
  */
 function extractBusinessFields(obj, depth = 0) {
-  if (depth > 5 || obj === null || typeof obj !== 'object') return {};
+  if (depth > 6 || obj === null || typeof obj !== 'object') return {};
+
+  // Arrays: percorre até os 20 primeiros elementos para cobrir grids paginados
+  if (Array.isArray(obj)) {
+    const found = {};
+    const limit = Math.min(obj.length, 20);
+    for (let i = 0; i < limit; i++) {
+      const nested = extractBusinessFields(obj[i], depth + 1);
+      for (const [nk, nv] of Object.entries(nested)) {
+        if (!(nk in found)) found[nk] = nv;
+      }
+    }
+    return found;
+  }
 
   const found = {};
   for (const [key, value] of Object.entries(obj)) {
     const lk = key.toLowerCase();
 
-    if (BUSINESS_FIELDS.includes(lk)) {
+    // O(1) hash lookup — mais rápido que Array.includes() para sets > 20 itens
+    if (BUSINESS_FIELDS_SET.has(lk)) {
       // Preserva a chave com capitalização original para exibição no relatório
       found[key] = value;
     }
 
-    if (value !== null && typeof value === 'object' && depth < 5) {
+    if (value !== null && typeof value === 'object' && depth < 6) {
       const nested = extractBusinessFields(value, depth + 1);
       // Campos do nível pai têm prioridade — não sobrescreve com achados filhos
       for (const [nk, nv] of Object.entries(nested)) {

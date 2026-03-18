@@ -332,6 +332,18 @@ function buildDetailContent(req) {
     .filter((k) => bf[k] != null || bf[k.toLowerCase()] != null)
     .map((k) => [k, String(bf[k] ?? bf[k.toLowerCase()])]);
 
+  // HAR timing breakdown (só disponível quando DevTools estiver aberto durante a captura)
+  const timing = req.timing;
+  const timingRows = timing ? [
+    timing.dnsMs     >= 0 ? ['DNS lookup',        `${timing.dnsMs}ms`]         : null,
+    timing.tcpMs     >= 0 ? ['TCP handshake',     `${timing.tcpMs}ms`]         : null,
+    timing.sslMs     >= 0 ? ['TLS handshake',     `${timing.sslMs}ms`]         : null,
+    timing.sendMs    >= 0 ? ['Envio request',     `${timing.sendMs}ms`]        : null,
+    timing.waitMs    >= 0 ? ['TTFB (servidor)',   `${timing.waitMs}ms`]        : null,
+    timing.receiveMs >= 0 ? ['Download resp.',   `${timing.receiveMs}ms`]    : null,
+    timing.blockedMs >= 0 ? ['Em fila',           `${timing.blockedMs}ms`]    : null,
+  ].filter(Boolean) : [];
+
   const classDetails = [
     ['classificação', req.classification?.category || '—'],
     ['crítico',       req.classification?.isCritical ? '⚠ SIM' : 'não'],
@@ -339,9 +351,12 @@ function buildDetailContent(req) {
     ['motivos',       (req.classification?.reasons || []).join(' | ') || '—'],
     ['status HTTP',   req.status || '—'],
     ['duração',       fmtDuration(req.duration || 0)],
+    req.contentType  ? ['content-type',  req.contentType]  : null,
+    req.transferSize >= 0 ? ['transferido', `${req.transferSize} bytes`] : null,
     ['timestamp',     new Date(req.timestamp || 0).toLocaleString('pt-BR')],
-    ['fonte',         req.source || '—'],
-  ];
+    ['fonte captura', req.source || '—'],
+    req.resourceType ? ['tipo recurso', req.resourceType] : null,
+  ].filter(Boolean);
 
   const kvList = (rows) => rows.map(([k, v]) =>
     `<li><span class="k">${escHtml(k)}</span><span class="v">${escHtml(String(v))}</span></li>`
@@ -383,6 +398,11 @@ function buildDetailContent(req) {
         <h4>Classificação</h4>
         <ul class="kv-list">${kvList(classDetails)}</ul>
       </div>
+      ${timingRows.length ? `
+      <div class="detail-block">
+        <h4>HAR Timing (camada de rede)</h4>
+        <ul class="kv-list">${kvList(timingRows)}</ul>
+      </div>` : ''}
       ${errorSection}
       ${payloadSection}
       ${responseSection}
@@ -434,6 +454,9 @@ function renderServiceMap(spServices, otherServices) {
             <li><span class="k">Chamadas</span><span class="v">${e.callCount}</span></li>
             <li><span class="k">Tempo máx</span><span class="v">${fmtDuration(e.maxDuration)}</span></li>
             <li><span class="k">Tempo total</span><span class="v">${fmtDuration(e.totalDuration)}</span></li>
+            ${e.waitMsCount > 0 ? `
+            <li><span class="k">TTFB médio (servidor)</span><span class="v">${Math.round(e.waitMsTotal / e.waitMsCount)}ms</span></li>
+            <li><span class="k">TTFB máx (servidor)</span><span class="v">${e.maxWaitMs}ms</span></li>` : ''}
           </ul>
         </div>`;
     }

@@ -179,6 +179,31 @@ function classifyByServiceName(serviceName) {
     sn.includes('workflow')
   ) return CATEGORIES.BUSINESS;
 
+  // ── Métodos SP (Service Providers Sankhya) ────────────────────────────
+  // Classes que terminam com "SP" (ex: RelatorioBalanceteSP, NotaFiscalSP)
+  // executam lógica de negócio especializada. A categoria é inferida pelo
+  // nome do MÉTODO: "gera", "calcula", "processa", "emite" → BUSINESS;
+  // "valida", "confirma", "aprova", "cancela" → BUSINESS (aprovação);
+  // "importa", "exporta" → PERSIST (I/O de dados).
+  if (/\bSP\./i.test(serviceName)) {
+    if (
+      sn.includes('gera')     || sn.includes('calcula')  ||
+      sn.includes('processa') || sn.includes('emite')    ||
+      sn.includes('relatorio')|| sn.includes('report')
+    ) return CATEGORIES.BUSINESS;
+
+    if (
+      sn.includes('valida')   || sn.includes('confirma') ||
+      sn.includes('aprova')   || sn.includes('cancela')  ||
+      sn.includes('rejeita')  || sn.includes('libera')
+    ) return CATEGORIES.BUSINESS;
+
+    if (sn.includes('importa') || sn.includes('exporta')) return CATEGORIES.PERSIST;
+
+    // SP genérico sem método reconhecido — ainda é BUSINESS por ser SP
+    return CATEGORIES.BUSINESS;
+  }
+
   return null;
 }
 
@@ -280,6 +305,23 @@ export function classifyRequest(request) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Verifica se o serviceName pertence a uma classe SP do Sankhya.
+ *
+ * No padrão de nomenclatura Sankhya, classes cujo nome termina com "SP"
+ * (ex: RelatorioBalanceteSP, AvisoSistemaSP, SystemUtilsSP) são Service
+ * Providers e geralmente estão vinculadas a uma classe de origem registrada
+ * no campo `application`. Chamadas SP devem SEMPRE aparecer no relatório.
+ *
+ * @param {string|null} serviceName  valor do parâmetro serviceName da chamada
+ * @returns {boolean}
+ */
+export function hasSPClass(serviceName) {
+  if (!serviceName) return false;
+  // Padrão: a parte do nome antes do primeiro "." termina com "SP"
+  return /\bSP\./i.test(serviceName);
+}
+
+/**
  * Retorna true se a requisição deve aparecer no relatório.
  * Exclui apenas itens explicitamente marcados como IRRELEVANTE.
  *
@@ -292,14 +334,26 @@ export function isRelevant(request) {
 
 /**
  * Retorna true se a requisição deve ser destacada no relatório
- * (crítica, gargalo, chamada de negócio ou persistência).
+ * (crítica, gargalo, chamada de negócio, persistência ou classe SP).
  *
- * @param {{ url: string, classification: Object }} request
+ * Chamadas cujo serviceName contém uma classe SP (ex: RelatorioBalanceteSP)
+ * são sempre marcadas como prioritárias porque estão vinculadas a uma
+ * classe de origem no backend e têm impacto direto no comportamento do sistema.
+ *
+ * @param {{ url: string, classification: Object, queryParams: Object, parsedPayload: Object }} request
  * @returns {boolean}
  */
 export function isPriority(request) {
-  const { url = '', classification } = request;
+  const { url = '', classification, queryParams, parsedPayload } = request;
   if (!classification) return false;
+
+  // Chamadas SP são sempre prioritárias — vinculadas à classe de origem
+  const sn =
+    queryParams?.serviceName ??
+    parsedPayload?.businessFields?.serviceName ??
+    parsedPayload?.businessFields?.servicename;
+  if (hasSPClass(sn)) return true;
+
   return (
     classification.isCritical ||
     classification.isBottleneck ||

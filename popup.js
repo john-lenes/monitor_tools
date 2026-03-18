@@ -328,6 +328,12 @@ function buildLocalSuggestions(req) {
 function isPriority(req) {
   const c = req.classification;
   if (!c) return false;
+  // Chamadas cujo serviceName contém classe SP são sempre prioritárias
+  const sn =
+    req.queryParams?.serviceName ??
+    req.parsedPayload?.businessFields?.serviceName ??
+    req.parsedPayload?.businessFields?.servicename ?? '';
+  if (/\bSP\./i.test(sn)) return true;
   return (
     c.isCritical || c.isBottleneck ||
     c.category === 'REGRA DE NEGÓCIO' ||
@@ -337,12 +343,45 @@ function isPriority(req) {
 }
 
 // ---------------------------------------------------------------------------
-// Polling de atualizações
+// Atualizações em tempo real via onMessage
 // ---------------------------------------------------------------------------
+//
+// O background já envia REQUEST_ADDED após cada requisição capturada.
+// O popup escuta essas mensagens e atualiza a lista de forma incremental,
+// eliminando a necessidade de buscar a sessão inteira a cada ciclo de polling.
+// Isso reduz o tráfego de IPC de O(n) por tick para O(1) por evento.
+
+chrome.runtime.onMessage.addListener((message) => {
+  if (message.action !== 'REQUEST_ADDED') return;
+  const { request, stats } = message;
+  if (!request) return;
+
+  // Atualiza request existente (merge do DevTools) ou adiciona novo
+  const idx = allRequests.findIndex((r) => r.id === request.id);
+  if (idx >= 0) {
+    allRequests[idx] = request;
+  } else {
+    allRequests.push(request);
+  }
+
+  updateStats(stats);
+  renderList();
+});
+
+// ---------------------------------------------------------------------------
+// Polling de status (apenas estado — sem dados da sessão)
+// ---------------------------------------------------------------------------
+//
+// O polling agora verifica SOMENTE o estado da sessão (idle/monitoring/finished)
+// a cada 5 segundos, como fallback para mudanças que possam não gerar
+// REQUEST_ADDED (ex: sessão finalizada em outra aba). Os dados das requisições
+// chegam via onMessage (acima), sem necessidade de busca periódica.
+
+const POLL_INTERVAL_MS = 5000;
 
 function startPolling() {
   if (pollIntervalId) return;
-  pollIntervalId = setInterval(fetchStatus, 1500);
+  pollIntervalId = setInterval(fetchStatus, POLL_INTERVAL_MS);
 }
 
 function stopPolling() {
@@ -352,16 +391,11 @@ function stopPolling() {
 async function fetchStatus() {
   try {
     const res = await sendMsg({ action: 'GET_STATUS' });
-    applyStatus(res.status);
-    updateStats(res.stats);
-
-    if (res.status !== 'idle') {
-      const full = await sendMsg({ action: 'GET_SESSION_DATA' });
-      if (full.session?.requests) {
-        allRequests = full.session.requests;
-        renderList();
-      }
+    // Só re-renderiza se o estado mudou (evita trabalho desnecessário)
+    if (res.status !== currentStatus) {
+      applyStatus(res.status);
     }
+    updateStats(res.stats);
   } catch (_) { /* background reiniciou — será retomado no próximo tick */ }
 }
 
@@ -515,7 +549,11 @@ function escHtml(str) {
     if (res.status !== 'idle') {
       const full = await sendMsg({ action: 'GET_SESSION_DATA' });
       if (full.session?.requests) {
-        allRequests = full.session.requests;
+        // Mescla com requests que possam ter chegado via REQUEST_ADDED
+        // entre o registro do onMessage e a conclusão desta chamada async.
+        const sessionIds = new Set(full.session.requests.map((r) => r.id));
+        const pending    = allRequests.filter((r) => !sessionIds.has(r.id));
+        allRequests = [...full.session.requests, ...pending];
         sessionInput.value = full.session.name || '';
         renderList();
       }

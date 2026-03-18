@@ -99,6 +99,15 @@ export function normalizeRequest(raw, source = 'content') {
     // parcialmente truncadas mas ainda contêm dados suficientes para diagnóstico.
     requestBody:     truncate(raw.requestBody, 8192),
     responseBody:    truncate(raw.responseBody, 8192),
+    // Campos extras — exclusivos de entradas vindas do DevTools (HAR)
+    // Quando source='content' esses campos ficam null/undefined (inofensivo).
+    timing:          raw.timing        ?? null,   // { dnsMs, tcpMs, sslMs, sendMs, waitMs, receiveMs, blockedMs }
+    contentType:     raw.contentType   ?? null,   // mime type autoritativo da resposta
+    transferSize:    raw.transferSize  ?? -1,     // bytes transferidos (comprimido; -1 = desconhecido)
+    responseSize:    raw.responseSize  ?? -1,     // bytes descomprimidos
+    spHint:          raw.spHint        ?? false,  // serviceName contém "SP." (detecção prévia no devtools.js)
+    initiator:       raw.initiator     ?? null,   // { type, url } — quem disparou a requisição
+    resourceType:    raw.resourceType  ?? null,   // tipo Chrome: 'xhr', 'fetch', 'document', etc.
   };
 }
 
@@ -209,6 +218,15 @@ export function mergeWithDevtools(target, devtoolsReq) {
     target.responseHeaders = { ...target.responseHeaders, ...devtoolsReq.responseHeaders };
   }
 
+  // Campos exclusivos do HAR — enriquecem entradas do content script
+  if (devtoolsReq.timing)       target.timing       = devtoolsReq.timing;
+  if (devtoolsReq.contentType)  target.contentType  = devtoolsReq.contentType;
+  if (devtoolsReq.transferSize >= 0) target.transferSize = devtoolsReq.transferSize;
+  if (devtoolsReq.responseSize >= 0) target.responseSize = devtoolsReq.responseSize;
+  if (devtoolsReq.spHint)       target.spHint       = devtoolsReq.spHint;
+  if (devtoolsReq.initiator)    target.initiator    = devtoolsReq.initiator;
+  if (devtoolsReq.resourceType) target.resourceType = devtoolsReq.resourceType;
+
   // Marca a entrada como enriquecida para fins de diagnóstico no relatório
   target.source = 'merged';
 }
@@ -243,6 +261,10 @@ export function mergeWithDevtools(target, devtoolsReq) {
  * @param {string} method  Método HTTP em uppercase
  * @returns {boolean}  true = prosseguir com processamento e armazenamento
  */
+
+// Regex compilado uma vez em nível de módulo (evita recriar a cada chamada)
+const _STATIC_EXT_RE_WORTH = /\.(?:png|jpe?g|gif|svg|ico|css|js|woff2?|ttf|eot|map)(?:\?|#|$)/i;
+
 export function isWorthProcessing(url, method) {
   if (!url) return false;
 
@@ -253,8 +275,7 @@ export function isWorthProcessing(url, method) {
   if (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') return true;
 
   // Descarta GETs com extensão de arquivo estático (imagens, CSS, JS, fontes)
-  const staticExt = /\.(?:png|jpe?g|gif|svg|ico|css|js|woff2?|ttf|eot|map)(?:\?|#|$)/i;
-  if (staticExt.test(url)) return false;
+  if (_STATIC_EXT_RE_WORTH.test(url)) return false;
 
   // Demais GETs (APIs REST, endpoints de dados) são incluídos para análise
   return true;

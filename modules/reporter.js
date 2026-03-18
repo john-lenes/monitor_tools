@@ -258,6 +258,12 @@ export function getServiceMap(requests = []) {
         totalDuration: 0,
         hasCritical:   false,
         hasBottleneck: false,
+        // Acumuladores de TTFB (server processing time) — só populados quando HAR disponível
+        waitMsTotal:   0,
+        waitMsCount:   0,
+        maxWaitMs:     0,
+        // Lista de chamadas individuais (para auditoria SP detalhada)
+        calls:         [],
       });
     }
 
@@ -268,11 +274,32 @@ export function getServiceMap(requests = []) {
     if (req.classification?.isCritical)   entry.hasCritical  = true;
     if (req.classification?.isBottleneck) entry.hasBottleneck = true;
 
+    if (req.timing?.waitMs >= 0) {
+      entry.waitMsTotal += req.timing.waitMs;
+      entry.waitMsCount++;
+      entry.maxWaitMs = Math.max(entry.maxWaitMs, req.timing.waitMs);
+    }
+
     const app = req.queryParams?.application ?? req.parsedPayload?.businessFields?.application;
     if (app) entry.applications.add(app);
 
     const cat = req.classification?.category;
     if (cat && cat !== CATEGORIES.IRRELEVANT) entry.categories.add(cat);
+
+    // Guarda referência da chamada individual para seção de auditoria SP
+    if (entry.isSP) {
+      entry.calls.push({
+        url:      req.url,
+        method:   req.method,
+        status:   req.status,
+        duration: req.duration,
+        timing:   req.timing   ?? null,
+        source:   req.source,
+        error:    req.parsedResponse?.errorMessage ?? null,
+        app:      app ?? null,
+        timestamp: req.timestamp,
+      });
+    }
   }
 
   const entries = [...map.values()];
@@ -289,6 +316,27 @@ export function getServiceMap(requests = []) {
 const LINE_FULL  = '='.repeat(62);
 const LINE_LIGHT = '-'.repeat(42);
 const fmt = (ms) => ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${ms}ms`;
+
+/**
+ * Formata o breakdown de timing HAR numa string compacta de uma linha.
+ * Fases com valor −1 (não ocorreram ou não disponíveis) são omitidas.
+ * Exemplo: "dns:2ms  tcp:12ms  ttfb:238ms  rx:18ms"
+ *
+ * @param {Object|null} timing  objeto timing normalizado do HAR
+ * @returns {string|null}
+ */
+function formatHARTiming(timing) {
+  if (!timing) return null;
+  const parts = [];
+  if (timing.dnsMs     >= 0) parts.push(`dns:${timing.dnsMs}ms`);
+  if (timing.tcpMs     >= 0) parts.push(`tcp:${timing.tcpMs}ms`);
+  if (timing.sslMs     >= 0) parts.push(`tls:${timing.sslMs}ms`);
+  if (timing.sendMs    >= 0) parts.push(`tx:${timing.sendMs}ms`);
+  if (timing.waitMs    >= 0) parts.push(`ttfb:${timing.waitMs}ms`);     // TTFB = server processing
+  if (timing.receiveMs >= 0) parts.push(`rx:${timing.receiveMs}ms`);
+  if (timing.blockedMs >= 0) parts.push(`queue:${timing.blockedMs}ms`);
+  return parts.length ? parts.join('  ') : null;
+}
 
 /**
  * Gera o relatório completo em texto plano pronto para exportação.
@@ -388,15 +436,19 @@ export function generateTextReport(session) {
       lines.push('  ' + '-'.repeat(50));
       lines.push('');
       for (const e of spServices) {
-        const apps  = [...e.applications].join(', ') || '—';
-        const cats  = [...e.categories].join(' | ')  || '—';
-        const flags = [e.hasCritical ? '⚠ CRÍTICO' : '', e.hasBottleneck ? '⚡ GARGALO' : ''].filter(Boolean).join('  ');
+        const apps   = [...e.applications].join(', ') || '—';
+        const cats   = [...e.categories].join(' | ')  || '—';
+        const flags  = [e.hasCritical ? '⚠ CRÍTICO' : '', e.hasBottleneck ? '⚡ GARGALO' : ''].filter(Boolean).join('  ');
+        const avgWait = e.waitMsCount > 0 ? Math.round(e.waitMsTotal / e.waitMsCount) : null;
         lines.push(`  [★ SP] ${e.serviceName}`);
-        lines.push(`         Classe SP     : ${e.spClass}`);
-        lines.push(`         Método        : ${e.method}`);
-        lines.push(`         Classe origem : ${apps}`);
-        lines.push(`         Categoria     : ${cats}`);
-        lines.push(`         Chamadas      : ${e.callCount}  |  Tempo máx: ${fmt(e.maxDuration)}  |  Total: ${fmt(e.totalDuration)}`);
+        lines.push(`         Classe SP          : ${e.spClass}`);
+        lines.push(`         Método             : ${e.method}`);
+        lines.push(`         Classe origem (app): ${apps}`);
+        lines.push(`         Categoria          : ${cats}`);
+        lines.push(`         Chamadas           : ${e.callCount}  |  Tempo máx: ${fmt(e.maxDuration)}  |  Total: ${fmt(e.totalDuration)}`);
+        if (avgWait !== null) {
+          lines.push(`         TTFB médio (server): ${avgWait}ms  |  TTFB máx: ${e.maxWaitMs}ms`);
+        }
         if (flags) lines.push(`         ${flags}`);
         lines.push('');
       }
@@ -419,6 +471,54 @@ export function generateTextReport(session) {
     }
   }
 
+  // Seção de auditoria SP — rastreamento individual de cada chamada SP com timing HAR
+  // Esta seção é o coração do diagnóstico: mostra CADA execução de SP com
+  // seu timing detalhado (dns/tcp/tls/ttfb/rx) quando capturado pelo DevTools.
+  // O TTFB (Time to First Byte = wait) representa o tempo de processamento no servidor.
+  const spCalls = requests.filter((r) => {
+    const sn = extractServiceName(r);
+    return sn && /\bSP\./i.test(sn) && r.classification?.category !== CATEGORIES.IRRELEVANT;
+  }).sort((a, b) => (b.duration || 0) - (a.duration || 0));
+
+  if (spCalls.length) {
+    lines.push(LINE_LIGHT);
+    lines.push('★ AUDITORIA SP — CHAMADAS INDIVIDUAIS (detalhes HAR)');
+    lines.push('  TTFB = Time to First Byte = processamento no servidor');
+    lines.push(LINE_LIGHT);
+
+    spCalls.forEach((req, i) => {
+      const sn    = extractServiceName(req) ?? '—';
+      const spCls = sn.includes('.') ? sn.split('.')[0] : sn;
+      const meth  = sn.includes('.') ? sn.split('.').slice(1).join('.') : '—';
+      const app   = req.queryParams?.application
+                 ?? req.parsedPayload?.businessFields?.application
+                 ?? '—';
+      const ts    = req.timestamp ? new Date(req.timestamp).toLocaleTimeString('pt-BR') : '—';
+      const harTiming = formatHARTiming(req.timing);
+
+      lines.push('');
+      lines.push(`  #${String(i + 1).padStart(2)} ${spCls}.${meth}`);
+      lines.push(`       Classe SP     : ${spCls}`);
+      lines.push(`       Método SP     : ${meth}`);
+      lines.push(`       Classe origem : ${app}`);
+      lines.push(`       Hora          : ${ts}`);
+      lines.push(`       Duração total : ${fmt(req.duration || 0)}  |  HTTP ${req.status || '—'}`);
+      lines.push(`       Fonte captura : ${req.source || '—'}`);
+      if (harTiming) {
+        lines.push(`       HAR timing    : ${harTiming}`);
+      } else {
+        lines.push(`       HAR timing    : (abrir DevTools para capturar timing detalhado)`);
+      }
+      if (req.classification?.isCritical) {
+        lines.push(`       ⚠ CRÍTICO     : ${req.parsedResponse?.errorMessage?.substring(0, 100) ?? 'erro reportado'}`);
+      }
+      if (req.classification?.isBottleneck) {
+        lines.push(`       ⚡ GARGALO     : tempo acima de 2s — verificar processamento SP no servidor`);
+      }
+    });
+    lines.push('');
+  }
+
   // Seção de críticos com detalhes do erro
   const criticals = requests.filter((r) => r.classification?.isCritical);
   if (criticals.length) {
@@ -428,13 +528,13 @@ export function generateTextReport(session) {
 
     criticals.forEach((req, i) => {
       const sn = extractServiceName(req) ?? '—';
+      const harTiming = formatHARTiming(req.timing);
       lines.push('');
       lines.push(`${String(i + 1).padStart(2)}. ${req.method} ${req.url}`);
       lines.push(`    serviceName : ${sn}`);
-      lines.push(`    status HTTP : ${req.status || '—'}`);
-      if (req.parsedResponse?.errorMessage) {
-        lines.push(`    mensagem    : ${req.parsedResponse.errorMessage}`);
-      }
+      lines.push(`    status HTTP : ${req.status || '—'}  |  duração: ${fmt(req.duration || 0)}`);
+      if (harTiming)                        lines.push(`    HAR timing  : ${harTiming}`);
+      if (req.parsedResponse?.errorMessage) lines.push(`    mensagem    : ${req.parsedResponse.errorMessage}`);
       if (req.classification?.reasons?.length) {
         lines.push(`    diagnóstico : ${req.classification.reasons.join(' | ')}`);
       }

@@ -157,7 +157,10 @@
           }
 
           emit({
-            url:             mon.url,
+            // Usa responseURL (final URL após redirecionamentos) quando disponível.
+            // Exemplo: uma requisição a /mge/login pode redirecionar para /mge/auth/sso,
+            // e o responseURL reflete o destino final — importante para análise de fluxo.
+            url:             this.responseURL || mon.url,
             method:          mon.method,
             requestBody:     mon.requestBody,
             responseBody:    (this.responseText || '').substring(0, MAX_BODY_LEN),

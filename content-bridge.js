@@ -97,6 +97,39 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Batching de requests — reduz acordadas do service worker
+  // ---------------------------------------------------------------------------
+  //
+  // PROBLEMA: cada requisição capturada disparava um chrome.runtime.sendMessage
+  // individual. Em rajadas (carregamento de página com 20+ XHRs), isso acordava
+  // o service worker repetidamente com overhead de IPC por mensagem.
+  //
+  // SOLUÇÃO: acumular requests por até BATCH_DELAY_MS antes de enviar ao
+  // background em um único sendMessage com o array completo. O background
+  // processa o lote via REQUEST_CAPTURED_BATCH.
+  // O delay é imperceptível para diagnóstico (50ms) mas reduz drasticamente
+  // o número de acordadas do SW em rajadas.
+
+  const BATCH_DELAY_MS = 50;
+  const _batchQueue = [];
+  let   _batchTimer = null;
+
+  function flushBatch() {
+    const batch = _batchQueue.splice(0); // esvazia a fila
+    if (!batch.length) return;
+    try {
+      chrome.runtime.sendMessage({
+        action:   'REQUEST_CAPTURED_BATCH',
+        requests: batch,
+      }).catch((err) => {
+        if (isContextError(err)) handleContextInvalidated();
+      });
+    } catch (e) {
+      if (isContextError(e)) handleContextInvalidated();
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Listener de mensagens vindas do MAIN world
   // ---------------------------------------------------------------------------
 
@@ -116,20 +149,13 @@
     const requestData = event.data.data;
     if (!requestData || !requestData.url) return;
 
-    // Repassa ao background de forma assíncrona
-    try {
-      chrome.runtime.sendMessage({
-        action:  'REQUEST_CAPTURED',
-        request: requestData,
-      }).catch((err) => {
-        // O service worker pode ter sido pausado — o Chrome o reiniciará
-        // na próxima mensagem. Requisições perdidas durante o reinício
-        // são aceitáveis no contexto de monitoramento de diagnóstico.
-        if (isContextError(err)) handleContextInvalidated();
-      });
-    } catch (e) {
-      // Contexto invalidado de forma síncrona (raro mas possível)
-      if (isContextError(e)) handleContextInvalidated();
+    // Adiciona ao lote e agenda flush se ainda não agendado
+    _batchQueue.push(requestData);
+    if (!_batchTimer) {
+      _batchTimer = setTimeout(() => {
+        _batchTimer = null;
+        flushBatch();
+      }, BATCH_DELAY_MS);
     }
   }
 

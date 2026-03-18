@@ -52,24 +52,71 @@ const State = Object.freeze({
 });
 
 // ---------------------------------------------------------------------------
-// Acesso ao storage
+// Cache em memória — elimina I/O de storage por requisição capturada
 // ---------------------------------------------------------------------------
+//
+// PROBLEMA ORIGINAL: processAndStore fazia chrome.storage.local.get + set
+// a cada requisição. Em rajadas de 20+ XHRs simultâneos (carregamento de
+// página), isso gerava dezenas de operações de disco concorrentes, travando
+// o processo do browser e o event loop do service worker.
+//
+// SOLUÇÃO: manter estado e sessão em variáveis de módulo (RAM). Escritas ao
+// storage são coaleizadas num único flush a cada STORAGE_FLUSH_MS ms.
+// Leituras são imediatas (sem I/O). A durabilidade é preservada: qualquer
+// dado escrito na memória será persistido em no máximo STORAGE_FLUSH_MS ms.
 
-/** Lê o estado e a sessão atuais do storage. */
-async function readStorage() {
+let _memState     = State.IDLE;
+let _memSession   = null;
+let _cacheReady   = false;   // true após primeira carga do storage
+let _flushTimer   = null;    // handle do setTimeout de flush em batch
+
+const STORAGE_FLUSH_MS = 400; // intervalo máximo de delay entre writes
+
+/**
+ * Inicializa o cache lendo o storage UMA vez por vida do service worker.
+ * Chamadas subsequentes retornam imediatamente (guard _cacheReady).
+ */
+async function initCache() {
+  if (_cacheReady) return;
   const data = await chrome.storage.local.get([STORAGE_STATE, STORAGE_SESSION]);
-  return {
-    status:  data[STORAGE_STATE]   ?? State.IDLE,
-    session: data[STORAGE_SESSION] ?? null,
-  };
+  _memState   = data[STORAGE_STATE]   ?? State.IDLE;
+  _memSession = data[STORAGE_SESSION] ?? null;
+  _cacheReady = true;
 }
 
-/** Persiste estado e sessão no storage. */
-async function writeStorage(status, session) {
+/**
+ * Força a escrita imediata ao storage (sem aguardar o timer).
+ * Usar apenas em operações que exigem durabilidade imediata (STOP/CLEAR).
+ */
+async function flushToStorage() {
+  if (_flushTimer) { clearTimeout(_flushTimer); _flushTimer = null; }
   await chrome.storage.local.set({
-    [STORAGE_STATE]:   status,
-    [STORAGE_SESSION]: session,
+    [STORAGE_STATE]:   _memState,
+    [STORAGE_SESSION]: _memSession,
   });
+}
+
+/** Lê estado e sessão do cache em memória (sem I/O de disco). */
+function readStorage() {
+  return { status: _memState, session: _memSession };
+}
+
+/**
+ * Atualiza o cache em memória e agenda flush coaleizado para o storage.
+ * Múltiplas chamadas dentro de STORAGE_FLUSH_MS resultam em apenas UMA
+ * escrita ao disco, absorvendo rajadas de requisições sem overhead de I/O.
+ */
+function writeStorage(status, session) {
+  _memState   = status;
+  _memSession = session;
+  if (_flushTimer) return; // flush já agendado — valor mais recente será gravado
+  _flushTimer = setTimeout(() => {
+    _flushTimer = null;
+    chrome.storage.local.set({
+      [STORAGE_STATE]:   _memState,
+      [STORAGE_SESSION]: _memSession,
+    }).catch(() => {}); // dados já estão em memória; falha silenciosa é aceitável
+  }, STORAGE_FLUSH_MS);
 }
 
 // ---------------------------------------------------------------------------
@@ -86,7 +133,8 @@ async function writeStorage(status, session) {
  * @param {string} source  'content' (content-bridge) | 'devtools' (DevTools Network)
  */
 async function processAndStore(raw, source) {
-  const { status, session } = await readStorage();
+  await initCache(); // no-op na 2ª+ chamada — guard booleano em RAM
+  const { status, session } = readStorage(); // leitura de RAM, sem I/O
   if (status !== State.MONITORING || !session) return;
 
   const { url = '', method = 'GET' } = raw;
@@ -120,7 +168,7 @@ async function processAndStore(raw, source) {
       }
       // Re-classifica com os dados enriquecidos (pode detectar erro antes não visível)
       existing.classification = classifyRequest(existing);
-      await writeStorage(State.MONITORING, session);
+      writeStorage(State.MONITORING, session); // atualiza RAM + agenda flush
       // Notifica o popup para atualizar o item já exibido
       const mergeStats = getSessionStats(session.requests);
       chrome.runtime.sendMessage({ action: 'REQUEST_ADDED', request: existing, stats: mergeStats }).catch(() => {});
@@ -139,7 +187,7 @@ async function processAndStore(raw, source) {
   // [Passo 10] Persistir e notificar o popup
   session.requests = session.requests || [];
   session.requests.push(normalized);
-  await writeStorage(State.MONITORING, session);
+  writeStorage(State.MONITORING, session); // atualiza RAM + agenda flush em batch
 
   // Notifica o popup (ignora erro se popup estiver fechado)
   const stats = getSessionStats(session.requests);
@@ -168,6 +216,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
  * @returns {Promise<Object>}
  */
 async function handleMessage(message) {
+  await initCache(); // garante que o cache está carregado antes de qualquer operação
   switch (message.action) {
 
     // ── Iniciar sessão ──────────────────────────────────────────────────
@@ -180,43 +229,58 @@ async function handleMessage(message) {
         finishedAt: null,
         textReport: null,
       };
-      await writeStorage(State.MONITORING, session);
+      writeStorage(State.MONITORING, session);
+      await flushToStorage(); // garante persistência imediata ao iniciar
       return { success: true, status: State.MONITORING };
     }
 
     // ── Finalizar sessão ────────────────────────────────────────────────
     case 'STOP_SESSION': {
-      const { session } = await readStorage();
+      const { session } = readStorage();
       if (!session) return { success: false, error: 'Nenhuma sessão ativa' };
 
       session.finishedAt = Date.now();
       session.textReport = generateTextReport(session);
-      await writeStorage(State.FINISHED, session);
+      writeStorage(State.FINISHED, session);
+      await flushToStorage(); // garante persistência imediata ao finalizar
       return { success: true, status: State.FINISHED };
     }
 
     // ── Limpar sessão ───────────────────────────────────────────────────
     case 'CLEAR_SESSION': {
-      await writeStorage(State.IDLE, null);
+      writeStorage(State.IDLE, null);
+      await flushToStorage(); // garante persistência imediata ao limpar
       return { success: true, status: State.IDLE };
     }
 
     // ── Consultar status (usado pelo popup no polling) ──────────────────
     case 'GET_STATUS': {
-      const { status, session } = await readStorage();
+      const { status, session } = readStorage();
       const stats = session ? getSessionStats(session.requests || []) : null;
       return { status, stats, sessionName: session?.name ?? null };
     }
 
     // ── Dados completos da sessão (usado por report.html) ───────────────
     case 'GET_SESSION_DATA': {
-      const { status, session } = await readStorage();
+      const { status, session } = readStorage();
       return { status, session };
     }
 
-    // ── Captura vinda do content-bridge.js ─────────────────────────────
+    // ── Captura vinda do content-bridge.js (request único) ─────────────
     case 'REQUEST_CAPTURED': {
       await processAndStore(message.request, 'content');
+      return { received: true };
+    }
+
+    // ── Captura em lote do content-bridge.js (batch de requests) ────────
+    // Processa múltiplos requests em uma única mensagem IPC, reduzindo
+    // o número de acordadas do service worker em rajadas de requisições.
+    case 'REQUEST_CAPTURED_BATCH': {
+      if (Array.isArray(message.requests)) {
+        for (const req of message.requests) {
+          await processAndStore(req, 'content');
+        }
+      }
       return { received: true };
     }
 
@@ -228,13 +292,13 @@ async function handleMessage(message) {
 
     // ── Estado do monitoramento (consultado pelo content-bridge) ────────
     case 'GET_MONITORING_STATE': {
-      const { status } = await readStorage();
+      const { status } = readStorage();
       return { isMonitoring: status === State.MONITORING };
     }
 
     // ── Exportar dados da sessão em JSON ────────────────────────────────
     case 'EXPORT_JSON': {
-      const { session } = await readStorage();
+      const { session } = readStorage();
       if (!session) return { error: 'Nenhuma sessão disponível' };
       return { json: JSON.stringify(session, null, 2) };
     }
