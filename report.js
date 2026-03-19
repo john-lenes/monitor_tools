@@ -20,6 +20,7 @@
  */
 
 import { generateTextReport, generateSuggestions, getSessionStats, getServiceMap, filterEssential } from './modules/reporter.js';
+import { groupByFlow } from './modules/flow-analyzer.js';
 
 // ---------------------------------------------------------------------------
 // Bootstrap
@@ -74,6 +75,8 @@ function renderPage(container, session, status) {
 
   const criticals = session.requests.filter((r) => r.classification?.isCritical);
   const totalServices = spServices.length + otherServices.length;
+  // E9: fluxos funcionais
+  const flows = groupByFlow(session.requests);
 
   container.innerHTML = `
     <!-- Header -->
@@ -134,6 +137,7 @@ function renderPage(container, session, status) {
       <button class="tab-btn active" data-tab="calls">Chamadas (${relevLabel})</button>
       <button class="tab-btn" data-tab="criticals">Críticas (${criticals.length})</button>
       <button class="tab-btn sp-tab" data-tab="services">★ Serviços SP (${spServices.length}/${totalServices})</button>
+      <button class="tab-btn" data-tab="flows">Fluxo (${flows.length})</button>
       <button class="tab-btn" data-tab="suggestions">Sugestões (${suggestions.length})</button>
       <button class="tab-btn" data-tab="textreport">Relatório Texto</button>
     </div>
@@ -162,9 +166,15 @@ function renderPage(container, session, status) {
       </div>
     </div>
 
-    <!-- Tab: Sugestões -->
-    <div class="tab-panel" id="tab-suggestions">
+    <!-- Tab: Fluxo (E9) -->
+    <div class="tab-panel" id="tab-flows">
       <div class="section">
+        ${renderFlowTimeline(flows)}
+      </div>
+    </div>
+
+    <!-- Tab: Sugestões -->
+    <div class="tab-panel" id="tab-suggestions">      <div class="section">
         ${suggestions.length > 0
           ? `<ul class="suggestion-list">${suggestions.map((s) => `<li>${escHtml(s)}</li>`).join('')}</ul>`
           : '<p style="color:var(--muted);padding:20px 0">Nenhuma sugestão gerada.</p>'
@@ -233,6 +243,31 @@ function renderCallTable(requests) {
     let pathname = req.url;
     try { pathname = new URL(req.url).pathname; } catch (_) { /* usa url completa */ }
 
+    // E2/E5: coluna "Frontend / Hipótese" com badge de confiança
+    const corr = req.correlation;
+    const hyp  = req.hypothesis;
+    let frontendCell = '<span style="color:var(--muted)">—</span>';
+    if (corr?.frontendOwner?.file) {
+      const fname = corr.frontendOwner.file.split('/').pop();
+      const conf  = corr.confidence ?? 0;
+      const pct   = Math.round(conf * 100);
+      const badgeColor = conf >= 0.8 ? 'var(--success)' : conf >= 0.5 ? '#f59e0b' : 'var(--muted)';
+      frontendCell = `<span style="color:${badgeColor};font-size:11px;font-weight:600">[${pct}%]</span> ${escHtml(fname)}`;
+      if (hyp?.hypothesis) {
+        const hconf = Math.round((hyp.confidence ?? 0) * 100);
+        const hColor = (hyp.confidence ?? 0) >= 0.8 ? 'var(--success)' : (hyp.confidence ?? 0) >= 0.5 ? '#f59e0b' : 'var(--muted)';
+        frontendCell += `<br><span style="font-size:10px;color:${hColor}">[${hconf}%] ${escHtml((hyp.hypothesis || '').substring(0, 50))}…</span>`;
+      }
+    } else if (corr?.patternHint) {
+      const conf = corr.confidence ?? 0;
+      const pct  = Math.round(conf * 100);
+      frontendCell = `<span style="color:var(--muted);font-size:11px">[${pct}%] ${escHtml(corr.patternHint)}</span>`;
+    } else if (hyp?.hypothesis) {
+      const hconf = Math.round((hyp.confidence ?? 0) * 100);
+      const hColor = (hyp.confidence ?? 0) >= 0.4 ? '#f59e0b' : 'var(--muted)';
+      frontendCell = `<span style="font-size:10px;color:${hColor}">[${hconf}%] ${escHtml((hyp.hypothesis || '').substring(0, 60))}</span>`;
+    }
+
     return `
       <tr class="expandable${crit ? ' critical' : ''}" data-idx="${i}" data-id="${escHtml(req.id)}">
         <td><span class="method-badge ${mCls}">${escHtml(req.method)}</span></td>
@@ -242,9 +277,10 @@ function renderCallTable(requests) {
         <td><span class="time-badge time-${tCls}">${escHtml(dur)}</span></td>
         <td>${escHtml(String(req.status || '—'))}</td>
         <td><span class="cat-badge ${catCls}">${escHtml(cat)}${crit ? ' ⚠' : bot ? ' ⚡' : ''}</span></td>
+        <td style="font-size:11px;max-width:180px">${frontendCell}</td>
       </tr>
       <tr class="detail-row" id="detail-row-${i}">
-        <td colspan="7"></td>
+        <td colspan="8"></td>
       </tr>`;
   }).join('');
 
@@ -259,6 +295,7 @@ function renderCallTable(requests) {
           <th>Tempo</th>
           <th>Status</th>
           <th>Classificação</th>
+          <th>Frontend / Hipótese</th>
         </tr>
       </thead>
       <tbody>${rows}</tbody>
@@ -406,6 +443,84 @@ function buildDetailContent(req) {
         <h4>HAR Timing (camada de rede)</h4>
         <ul class="kv-list">${kvList(timingRows)}</ul>
       </div>` : ''}
+      ${(() => {
+        const corr = req.correlation;
+        if (!corr) return '';
+        const fo   = corr.frontendOwner;
+        const pct  = Math.round((corr.confidence ?? 0) * 100);
+        const rows = [
+          ['padrão detectado', corr.patternHint || '—'],
+          ['categoria',        corr.category    || '—'],
+          ['confiança',        `${pct}%`],
+          fo ? ['arquivo',     fo.file] : null,
+          fo ? ['função',      fo.fn  ] : null,
+          fo ? ['linha',       String(fo.line || '—')] : null,
+        ].filter(Boolean);
+        return `
+      <div class="detail-block">
+        <h4>🔗 Correlação Frontend</h4>
+        <ul class="kv-list">${kvList(rows)}</ul>
+      </div>`;
+      })()}
+      ${(() => {
+        const hyp = req.hypothesis;
+        if (!hyp?.hypothesis) return '';
+        const pct  = Math.round((hyp.confidence ?? 0) * 100);
+        const beans = (hyp.beans || []).map((b) => escHtml(b)).join(', ') || '—';
+        return `
+      <div class="detail-block">
+        <h4>💡 Hipótese de Backend</h4>
+        <ul class="kv-list">
+          <li><span class="k">hipótese</span><span class="v">${escHtml(hyp.hypothesis)}</span></li>
+          <li><span class="k">confiança</span><span class="v">${pct}%</span></li>
+          <li><span class="k">beans a inspecionar</span><span class="v">${beans}</span></li>
+        </ul>
+      </div>`;
+      })()}
+      ${(() => {
+        const ev = req.sourceEvidence;
+        if (!ev?.length) return '';
+        const items = ev.map((e) => `
+          <div style="margin-bottom:8px">
+            <code style="font-size:10px;opacity:.7">${escHtml(e.file)}:${e.lineNum || ''}</code>
+            <pre class="code-block" style="margin:2px 0 0">${escHtml(e.snippet || '')}</pre>
+          </div>`).join('');
+        return `
+      <div class="detail-block">
+        <h4>📄 Evidência no Código</h4>
+        ${items}
+      </div>`;
+      })()}
+      ${(() => {
+        const ui = req.uiContext;
+        if (!ui?.length) return '';
+        const baseTs = req.timestamp || 0;
+        const rows = ui.map((e) => {
+          const delta = baseTs ? Math.round((e.ts - baseTs) / 1000) : null;
+          const when  = delta !== null ? `${delta > 0 ? '+' : ''}${delta}s` : new Date(e.ts).toLocaleTimeString('pt-BR');
+          const label = [e.type, e.tag, e.id ? `#${e.id}` : '', e.text ? `"${e.text.substring(0,30)}"` : ''].filter(Boolean).join(' ');
+          return `<li><span class="k">${escHtml(when)}</span><span class="v">${escHtml(label)}</span></li>`;
+        }).join('');
+        return `
+      <div class="detail-block">
+        <h4>🖱 Ação do Usuário (antes da chamada)</h4>
+        <ul class="kv-list">${rows}</ul>
+      </div>`;
+      })()}
+      ${(() => {
+        const sc = req.screenContext;
+        if (!sc) return '';
+        const crumbs = (sc.breadcrumbs || []).join(' › ') || '—';
+        return `
+      <div class="detail-block">
+        <h4>🖥 Contexto da Tela</h4>
+        <ul class="kv-list">
+          <li><span class="k">título</span><span class="v">${escHtml(sc.title || '—')}</span></li>
+          <li><span class="k">hash</span><span class="v">${escHtml(sc.hash || '—')}</span></li>
+          <li><span class="k">breadcrumb</span><span class="v">${escHtml(crumbs)}</span></li>
+        </ul>
+      </div>`;
+      })()}
       ${errorSection}
       ${payloadSection}
       ${responseSection}
@@ -426,6 +541,61 @@ function buildDetailContent(req) {
  * @param {Object[]} otherServices demais entradas do getServiceMap
  * @returns {string}  HTML
  */
+
+// ---------------------------------------------------------------------------
+// Fluxos funcionais (E9)
+// ---------------------------------------------------------------------------
+function renderFlowTimeline(flows) {
+  if (!flows || !flows.length) {
+    return '<p style="color:var(--muted);padding:20px 0">Nenhum fluxo detectado. Execute ações no Sankhya com a sessão ativa.</p>';
+  }
+
+  return flows.map((flow, fi) => {
+    const dur = fmtDuration(flow.duration || 0);
+    const critBadge = flow.hasCritical   ? '<span class="cat-badge critical">⚠ CRÍTICO</span>' : '';
+    const botBadge  = flow.hasBottleneck ? '<span class="cat-badge bottleneck">⚡ GARGALO</span>' : '';
+    const spBadge   = flow.hasSP         ? '<span class="cat-badge business">★ SP</span>' : '';
+
+    let triggerText = 'sem evento';
+    if (flow.trigger) {
+      const t = flow.trigger;
+      const txt = t.text ? `"${(t.text).substring(0, 30)}"` : t.type;
+      triggerText = `${txt}`;
+    }
+
+    const innerRows = (flow.requests || []).map((req) => {
+      const sn  = req.queryParams?.serviceName
+               || req.parsedPayload?.businessFields?.serviceName
+               || req.parsedPayload?.businessFields?.servicename
+               || '—';
+      const rt  = req.parsedPayload?.requestType ?? '—';
+      const dur2 = fmtDuration(req.duration || 0);
+      const tCls = timeClass(req.duration || 0);
+      const mCls = 'method-' + ((['POST','GET','PUT','DELETE'].includes(req.method)) ? req.method : 'OTHER');
+      return `<tr>
+        <td>${new Date(req.timestamp || 0).toLocaleTimeString('pt-BR')}</td>
+        <td><span class="method-badge ${mCls}">${escHtml(req.method)}</span></td>
+        <td>${escHtml(sn)}</td>
+        <td>${escHtml(String(rt))}</td>
+        <td><span class="time-badge time-${tCls}">${escHtml(dur2)}</span></td>
+      </tr>`;
+    }).join('');
+
+    return `<details class="flow-group" ${fi === 0 ? 'open' : ''}>
+      <summary class="flow-header">
+        <strong>${escHtml(flow.name || 'Fluxo')}</strong>
+        <span class="flow-meta">${flow.requests.length} chamadas · ${escHtml(dur)} · trigger: ${escHtml(triggerText)}</span>
+        ${critBadge}${botBadge}${spBadge}
+        ${flow.application ? `<span style="font-size:11px;color:var(--muted)">app: ${escHtml(flow.application)}</span>` : ''}
+      </summary>
+      <table class="call-table" style="margin:8px 0 0 16px">
+        <thead><tr><th>Hora</th><th>Método</th><th>serviceName</th><th>Tipo</th><th>Tempo</th></tr></thead>
+        <tbody>${innerRows}</tbody>
+      </table>
+    </details>`;
+  }).join('');
+}
+
 function renderServiceMap(spServices, otherServices) {
   if (!spServices.length && !otherServices.length) {
     return '<p style="color:var(--muted);padding:20px 0">Nenhum serviço identificado nesta sessão.</p>';

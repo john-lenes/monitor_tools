@@ -23,6 +23,7 @@
  */
 
 import { CATEGORIES } from './classifier.js';
+import { computeRelevanceScore, buildHypothesis } from './correlator.js';
 
 // ---------------------------------------------------------------------------
 // Helper interno — extração de serviceName
@@ -425,6 +426,15 @@ export function generateTextReport(session) {
   lines.push(`Sessão: ${name}`);
   if (startedAt)  lines.push(`Início: ${new Date(startedAt).toLocaleString('pt-BR')}`);
   if (finishedAt) lines.push(`Fim:    ${new Date(finishedAt).toLocaleString('pt-BR')}`);
+
+  // E8: contexto inicial da tela (screenContext) — capturado pelo content-main.js
+  const firstScreenCtx = requests.find((r) => r.screenContext)?.screenContext;
+  if (firstScreenCtx) {
+    lines.push(`Tela inicial: ${firstScreenCtx.title || '—'} (${firstScreenCtx.hash || firstScreenCtx.url || '—'})`);
+    if (firstScreenCtx.breadcrumbs?.length) {
+      lines.push(`Navegação:    ${firstScreenCtx.breadcrumbs.join(' › ')}`);
+    }
+  }
   lines.push('');
 
   // Resumo
@@ -579,6 +589,22 @@ export function generateTextReport(session) {
       if (req.classification?.isBottleneck) {
         lines.push(`       ⚡ GARGALO     : tempo acima de 2s — verificar processamento SP no servidor`);
       }
+      // E2: atribuição frontend quando disponível
+      const corr = req.correlation;
+      if (corr?.frontendOwner) {
+        const file = corr.frontendOwner.file.split('/').pop();
+        const pct  = Math.round(corr.confidence * 100);
+        lines.push(`       Frontend      : ${file} → ${corr.frontendOwner.fn} (${pct}%)`);
+        lines.push(`       Padrão        : ${corr.frontendOwner.pattern}`);
+      }
+      // E5: hipótese de backend
+      if (req.hypothesis?.hypothesis) {
+        const pct = Math.round((req.hypothesis.confidence ?? 0) * 100);
+        lines.push(`       Hipótese BE   : ${req.hypothesis.hypothesis} [${pct}%]`);
+        if (req.hypothesis.beansToInspect?.length) {
+          lines.push(`       Beans         : ${req.hypothesis.beansToInspect.join(', ')}`);
+        }
+      }
     });
     lines.push('');
   }
@@ -601,6 +627,52 @@ export function generateTextReport(session) {
       if (req.parsedResponse?.errorMessage) lines.push(`    mensagem    : ${req.parsedResponse.errorMessage}`);
       if (req.classification?.reasons?.length) {
         lines.push(`    diagnóstico : ${req.classification.reasons.join(' | ')}`);
+      }
+    });
+    lines.push('');
+  }
+
+  // E5: Seção "HIPÓTESES DE BACKEND" — top-10 chamadas por relevância técnica
+  const relevantForHyp = requests
+    .filter((r) => r.classification?.category !== CATEGORIES.IRRELEVANT && r.hypothesis?.hypothesis)
+    .map((r) => ({ req: r, score: computeRelevanceScore(r) }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 10);
+
+  if (relevantForHyp.length) {
+    lines.push(LINE_LIGHT);
+    lines.push('HIPÓTESES DE BACKEND (top-10 por relevância)');
+    lines.push(LINE_LIGHT);
+
+    relevantForHyp.forEach(({ req, score }, i) => {
+      const sn   = extractServiceName(req) ?? '—';
+      const bf   = req.parsedPayload?.businessFields ?? {};
+      const rt   = req.parsedPayload?.requestType ?? '—';
+      const app  = req.queryParams?.application ?? bf.application ?? '—';
+      const ent  = bf.entityname ?? bf.entityName ?? '—';
+      const pk   = bf.pk ?? '—';
+      const hyp  = req.hypothesis;
+      const corr = req.correlation;
+
+      lines.push('');
+      lines.push(`  #${String(i + 1).padStart(2)} ${sn}  [score: ${score}]`);
+      lines.push(`       Tipo           : ${rt}`);
+      lines.push(`       Entidade       : ${ent}  |  PK: ${String(pk).substring(0, 60)}`);
+      lines.push(`       Application    : ${app}`);
+      if (corr?.frontendOwner) {
+        const fname = corr.frontendOwner.file.split('/').pop();
+        const pct   = Math.round(corr.confidence * 100);
+        lines.push(`       Frontend       : ${fname} → ${corr.frontendOwner.fn} [${pct}%]`);
+        lines.push(`       Padrão         : ${corr.frontendOwner.pattern}`);
+      } else if (corr?.patternHint) {
+        lines.push(`       Padrão (inf.)  : ${corr.patternHint}`);
+      }
+      if (hyp?.hypothesis) {
+        const pct = Math.round((hyp.confidence ?? 0) * 100);
+        lines.push(`       Hipótese BE    : ${hyp.hypothesis} [${pct}%]`);
+      }
+      if (hyp?.beansToInspect?.length) {
+        lines.push(`       Beans          : ${hyp.beansToInspect.join(', ')}`);
       }
     });
     lines.push('');

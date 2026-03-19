@@ -40,6 +40,73 @@ const QUERY_PARAMS_OF_INTEREST = new Set([
   'mgesession',
 ]);
 
+// ---------------------------------------------------------------------------
+// E3 — Enum de tipos de requisição Sankhya
+// ---------------------------------------------------------------------------
+
+/**
+ * REQUEST_TYPE — identifica o tipo funcional de cada chamada.
+ * Usado pelo classifier para refinar a categoria e pelo flow-analyzer para detectar sequências.
+ */
+export const REQUEST_TYPE = Object.freeze({
+  LOAD_GRID:      'LOAD_GRID',      // Carregamento de grid/lista de registros
+  SAVE_RECORD:    'SAVE_RECORD',    // Gravação de entidade (CRUDService.save)
+  DELETE_RECORD:  'DELETE_RECORD',  // Remoção de entidade
+  EXECUTE_ACTION: 'EXECUTE_ACTION', // Execução de action Sankhya (ActionExecutor)
+  OPEN_FORM:      'OPEN_FORM',      // Abertura de formulário
+  LOAD_FORM:      'LOAD_FORM',      // Carregamento de dados de formulário
+  CALL_LISTENER:  'CALL_LISTENER',  // Chamada a listener registrado
+  CALL_SP:        'CALL_SP',        // Chamada a classe SP (Service Provider)
+  UNKNOWN:        'UNKNOWN',        // Tipo não reconhecido
+});
+
+/**
+ * Infere o tipo funcional da requisição a partir do serviceName e dos campos extraídos.
+ *
+ * Regras em ordem de especificidade (mais específica primeiro):
+ *  1. SP → CALL_SP (padrão de classe SP do Sankhya)
+ *  2. CRUDService.loadRecords / loadGrid → LOAD_GRID
+ *  3. CRUDService.save → SAVE_RECORD
+ *  4. CRUDService.remove / delete → DELETE_RECORD
+ *  5. ActionExecutor.execute → EXECUTE_ACTION
+ *  6. campo listener presente → CALL_LISTENER
+ *  7. campo formID / formid presente → OPEN_FORM ou LOAD_FORM
+ *  8. fallback → UNKNOWN
+ *
+ * @param {string|null}  serviceName
+ * @param {Object}       businessFields  campos extraídos por extractBusinessFields
+ * @returns {string}  valor do enum REQUEST_TYPE
+ */
+function inferRequestType(serviceName, businessFields = {}) {
+  if (!serviceName) return REQUEST_TYPE.UNKNOWN;
+  const sn = serviceName.toLowerCase();
+
+  // Classe SP — prioridade máxima
+  if (/\bSP\./i.test(serviceName)) return REQUEST_TYPE.CALL_SP;
+
+  // Consulta de dados
+  if (sn.includes('loadrecords') || sn.includes('loadgrid') || sn.includes('.load')) return REQUEST_TYPE.LOAD_GRID;
+
+  // Persistência
+  if (sn.includes('crudservice.save') || (sn.includes('.save') && !sn.includes('saveconf'))) return REQUEST_TYPE.SAVE_RECORD;
+
+  // Remoção
+  if (sn.includes('.remove') || sn.includes('.delete') || sn.includes('crudservice.remove')) return REQUEST_TYPE.DELETE_RECORD;
+
+  // Ação
+  if (sn.includes('actionexecutor') || sn.includes('.execute')) return REQUEST_TYPE.EXECUTE_ACTION;
+
+  // Listener
+  const listener = businessFields.listener ?? businessFields.Listener;
+  if (listener) return REQUEST_TYPE.CALL_LISTENER;
+
+  // Formulário
+  const formId = businessFields.formid ?? businessFields.formID ?? businessFields.formId;
+  if (formId) return REQUEST_TYPE.OPEN_FORM;
+
+  return REQUEST_TYPE.UNKNOWN;
+}
+
 /**
  * Extrai os query parameters relevantes de uma URL do Sankhya.
  *
@@ -109,7 +176,7 @@ const BUSINESS_FIELDS_SET = new Set([
   'codtipvenda', 'codvol',
   'tipo', 'origem',
   // Identificador genérico e entidade
-  'id', 'entityname',
+  'id', 'entityname', 'rootentity',
   // Ações e eventos
   'action', 'event', 'listener', 'method',
   // Serviço e aplicação
@@ -120,6 +187,10 @@ const BUSINESS_FIELDS_SET = new Set([
   'dtinc', 'dtalter',
   // Financeiro
   'vlrnota', 'nossonumero',
+  // E3 — Novos campos de contexto de tela e metadados
+  'pk', 'formid', 'componentid', 'selectedtab', 'rowid',
+  'metadata', 'servicemodule',
+  'transactionid', 'correlationid',
 ]);
 
 /**
@@ -168,8 +239,18 @@ function extractBusinessFields(obj, depth = 0) {
 
     // O(1) hash lookup — mais rápido que Array.includes() para sets > 20 itens
     if (BUSINESS_FIELDS_SET.has(lk)) {
-      // Preserva a chave com capitalização original para exibição no relatório
-      found[key] = value;
+      // E3: pk pode ser objeto/array — serializa para string para armazenamento
+      if (lk === 'pk' && value !== null && typeof value === 'object') {
+        found[key] = JSON.stringify(value).substring(0, 200);
+      }
+      // E3: metadata e servicemodule podem ser muito grandes — truncar a 256 chars
+      else if ((lk === 'metadata' || lk === 'servicemodule') && typeof value === 'string') {
+        found[key] = value.substring(0, 256);
+      }
+      else {
+        // Preserva a chave com capitalização original para exibição no relatório
+        found[key] = value;
+      }
     }
 
     if (value !== null && typeof value === 'object' && depth < 6) {
@@ -218,6 +299,8 @@ export function parsePayload(body) {
     raw: '',
     parsed: null,
     businessFields: {},
+    requestType:    REQUEST_TYPE.UNKNOWN,
+    transactionId:  null,  // E3/E4: exposto no topo para uso pelo fingerprint
   };
 
   if (!body || typeof body !== 'string') return result;
@@ -232,6 +315,10 @@ export function parsePayload(body) {
     const json = JSON.parse(body);
     result.parsed = json;
     result.businessFields = extractBusinessFields(json);
+    // E3: infere tipo funcional e extrai transactionId para o topo
+    const sn = result.businessFields.serviceName ?? result.businessFields.servicename ?? null;
+    result.requestType   = inferRequestType(sn, result.businessFields);
+    result.transactionId = result.businessFields.transactionid ?? result.businessFields.transactionId ?? null;
     return result;
   } catch (_) { /* não é JSON — tenta próximo formato */ }
 
@@ -248,6 +335,9 @@ export function parsePayload(body) {
         const inner = JSON.parse(decodeURIComponent(flat.data));
         result.parsed = inner;
         result.businessFields = extractBusinessFields(inner);
+        const sn2 = result.businessFields.serviceName ?? result.businessFields.servicename ?? flat.serviceName ?? null;
+        result.requestType   = inferRequestType(sn2, result.businessFields);
+        result.transactionId = result.businessFields.transactionid ?? result.businessFields.transactionId ?? null;
         return result;
       } catch (_) { /* campo "data" não é JSON — cai no fallback */ }
     }
@@ -260,6 +350,9 @@ export function parsePayload(body) {
 
     result.parsed = flat;
     Object.assign(result.businessFields, extractBusinessFields(flat));
+    const sn3 = result.businessFields.serviceName ?? result.businessFields.servicename ?? null;
+    result.requestType   = inferRequestType(sn3, result.businessFields);
+    result.transactionId = result.businessFields.transactionid ?? result.businessFields.transactionId ?? null;
   } catch (_) { /* body não é form-urlencoded — ignora sem propagar erro */ }
 
   return result;

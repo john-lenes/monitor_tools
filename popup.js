@@ -213,11 +213,23 @@ function buildCallItem(req) {
   if (crit)     catClass = 'tag-critical';
   else if (bot) catClass = 'tag-bottleneck';
 
+  // E2: badge de correlação frontend
+  let corrBadge = '';
+  const corr = req.correlation;
+  if (corr && (corr.confidence ?? 0) >= 0.5) {
+    const fname = corr.frontendOwner?.file?.split('/').pop() ?? corr.patternHint ?? '';
+    const pct   = Math.round((corr.confidence ?? 0) * 100);
+    const bColor = (corr.confidence ?? 0) >= 0.8 ? '#15803d' : '#a16207';
+    corrBadge = fname
+      ? `<span style="font-size:10px;color:${bColor};font-weight:600;margin-left:4px">[${pct}%] ${escHtml(fname)}</span>`
+      : '';
+  }
+
   return `
     <div class="call-item${crit ? ' critical' : ''}" data-id="${escHtml(req.id)}">
       <span class="method-badge ${methodClass(method)}">${escHtml(method)}</span>
       <div class="call-info">
-        <div class="call-service">${name}</div>
+        <div class="call-service">${name}${corrBadge}</div>
         <div class="call-url">${path}</div>
       </div>
       <div class="call-right">

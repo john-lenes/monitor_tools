@@ -36,6 +36,7 @@ import { normalizeRequest, findDuplicate, mergeWithDevtools, isWorthProcessing }
 import { parseQueryParams, parsePayload, parseResponse }    from './modules/parser.js';
 import { classifyRequest, isStaticAsset, isPolling }        from './modules/classifier.js';
 import { generateTextReport, getSessionStats }              from './modules/reporter.js';
+import { correlate, buildHypothesis, lookupEvidence }       from './modules/correlator.js';
 
 // ---------------------------------------------------------------------------
 // Constantes
@@ -71,6 +72,13 @@ let _cacheReady   = false;   // true após primeira carga do storage
 let _flushTimer   = null;    // handle do setTimeout de flush em batch
 
 const STORAGE_FLUSH_MS = 400; // intervalo máximo de delay entre writes
+
+/**
+ * E6 — Índice de fontes JS construído pelo devtools.js (source-indexer).
+ * Armazenado em memória (não no storage — pode ser grande).
+ * Usado pelo passo 9.6 do pipeline para enriquecer correlações com evidência textual.
+ */
+let _sourceIndex = null;
 
 /**
  * Inicializa o cache lendo o storage UMA vez por vida do service worker.
@@ -183,6 +191,21 @@ async function processAndStore(raw, source) {
 
   // [Passo 9] Classificar — determina categoria funcional, criticidade e gargalos
   normalized.classification = classifyRequest(normalized);
+
+  // [Passo 9.6] Correlação frontend + hipótese de backend (E2 + E5 + E7)
+  // Identifica o padrão frontend que originou a chamada (callStack/initiator).
+  // Gera hipótese de classe/bean Java que provavelmente processou a requisição.
+  // Se o índice de sources (E6) estiver disponível, enriquece com evidência textual.
+  try {
+    const correlation = correlate(normalized);
+    if (_sourceIndex) {
+      const evidence = lookupEvidence(correlation, _sourceIndex);
+      correlation.sourceEvidence     = evidence.sourceEvidence;
+      correlation.confidence         = evidence.boostedConfidence;
+    }
+    normalized.correlation = correlation;
+    normalized.hypothesis  = buildHypothesis(normalized);
+  } catch (_) { /* correlação é best-effort — nunca bloqueia o pipeline */ }
 
   // [Passo 9.5] Cap de armazenamento para chamadas repetitivas não-essenciais.
   // SP, críticos e gargalos são SEMPRE armazenados (cada execução é única).
@@ -309,7 +332,11 @@ async function handleMessage(message) {
       await processAndStore(message.request, 'devtools');
       return { received: true };
     }
-
+    // ── Índice de fontes construído pelo devtools.js (E6) ───────────────────
+    case 'SOURCE_INDEX_READY': {
+      _sourceIndex = message.index ?? null;
+      return { received: true };
+    }
     // ── Estado do monitoramento (consultado pelo content-bridge) ────────
     case 'GET_MONITORING_STATE': {
       const { status } = readStorage();

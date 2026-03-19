@@ -58,6 +58,54 @@ export function generateRequestId() {
 // Normalização
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// E4 — Fingerprint de requisição
+// ---------------------------------------------------------------------------
+
+/**
+ * Parâmetros de sessão que NÃO devem fazer parte do fingerprint —
+ * mudam a cada sessão/request mas NÃO distinguem requisições logicamente diferentes.
+ */
+const _FP_IGNORE_PARAMS = new Set(['mgesession', 'outputtype', '_', 'jsessionid', 'token']);
+
+/**
+ * Calcula um fingerprint rápido para a requisição bruta.
+ *
+ * Composto por: método + URL normalizada (sem params de sessão) + serviceName + hash do body.
+ * Duas chamadas ao mesmo serviço com payloads diferentes (nunota diferente) geram
+ * fingerprints diferentes e NÃO serão colapsadas como duplicatas.
+ *
+ * @param {Object} raw  dados brutos da requisição
+ * @returns {string}
+ */
+function computeFingerprint(raw) {
+  const method = (raw.method || 'GET').toUpperCase();
+
+  // URL normalizada: remove params de sessão e mantém apenas caminho + params estáveis
+  let normalizedUrl = String(raw.url || '');
+  try {
+    const u = new URL(normalizedUrl.startsWith('http') ? normalizedUrl : `https://x.com${normalizedUrl}`);
+    _FP_IGNORE_PARAMS.forEach((p) => u.searchParams.delete(p));
+    // Extrai serviceName para incluir no fingerprint diretamente
+    normalizedUrl = u.pathname + (u.searchParams.toString() ? '?' + u.searchParams.toString() : '');
+  } catch (_) { /* URL malformada — usa bruta */ }
+
+  // serviceName da query string (identificador lógico do serviço)
+  let sn = '';
+  try {
+    const u2 = new URL((raw.url || '').startsWith('http') ? raw.url : `https://x.com${raw.url}`);
+    sn = u2.searchParams.get('serviceName') || u2.searchParams.get('servicename') || '';
+  } catch (_) {}
+
+  // Hash simples do body (soma de char codes dos primeiros 512 chars mod 65536)
+  const body = raw.requestBody || '';
+  let bodyHash = 0;
+  const limit = Math.min(body.length, 512);
+  for (let i = 0; i < limit; i++) bodyHash = (bodyHash + body.charCodeAt(i)) % 65536;
+
+  return `${method}|${normalizedUrl}|${sn}|${bodyHash}`;
+}
+
 /**
  * Transforma os dados brutos de uma requisição em um objeto CANÔNICO
  * padronizado para armazenamento e análise.
@@ -106,8 +154,15 @@ export function normalizeRequest(raw, source = 'content') {
     transferSize:    raw.transferSize  ?? -1,     // bytes transferidos (comprimido; -1 = desconhecido)
     responseSize:    raw.responseSize  ?? -1,     // bytes descomprimidos
     spHint:          raw.spHint        ?? false,  // serviceName contém "SP." (detecção prévia no devtools.js)
-    initiator:       raw.initiator     ?? null,   // { type, url } — quem disparou a requisição
+    initiator:       raw.initiator     ?? null,   // { type, url, topFrame, frames[] } — quem disparou a requisição
     resourceType:    raw.resourceType  ?? null,   // tipo Chrome: 'xhr', 'fetch', 'document', etc.
+    // E1: stack de chamadas do código da aplicação no momento do open()/fetch()
+    callStack:       raw.callStack     ?? null,   // [{ fn, file, line, col }]
+    // E8: contexto de UI e tela
+    uiContext:       raw.uiContext     ?? null,   // últimos 5 eventos DOM antes da requisição
+    screenContext:   raw.screenContext ?? null,   // { url, title, hash, breadcrumbs }
+    // E4: fingerprint para deduplicação robusta
+    fingerprint:     computeFingerprint(raw),
   };
 }
 
@@ -156,23 +211,28 @@ function truncate(value, maxLen) {
  * Encontra a entrada existente que corresponde à nova requisição.
  * Retorna a entrada ou null (null = não é duplicata, deve ser adicionada).
  *
- * Critério de duplicata: mesma URL + mesmo método HTTP + timestamps a
- * menos de 500ms de diferença (cobre o delta entre a captura do content
- * script no momento do send() e a captura do DevTools no onRequestFinished).
- *
- * Substituiu `isDuplicate` (boolean) para permitir merge inteligente no
- * background.js: quando o DevTools captura algo que o content já registrou,
- * enriquecemos a entrada em vez de descartar os dados melhores do DevTools.
+ * Critério de duplicata (em ordem de prioridade):
+ *  1. Fingerprint idêntico (URL normalizada + método + serviceName + hash de body)
+ *     — garante que payloads diferentes (nunota diferente) NÃO colidam.
+ *  2. URL + método + Δt < 300ms (fallback quando ambas as partes não têm fingerprint)
+ *     — cobre o delta entre a captura content-script e DevTools.
  *
  * @param {Object}   newReq     request normalizado recém chegado
  * @param {Object[]} existing   lista de requests já salvos na sessão atual
  * @returns {Object|null}  entrada existente ou null
  */
 export function findDuplicate(newReq, existing = []) {
+  // Critério 1: fingerprint idêntico (mais robusto — distingue payloads diferentes)
+  if (newReq.fingerprint) {
+    const byFp = existing.find((r) => r.fingerprint && r.fingerprint === newReq.fingerprint);
+    if (byFp) return byFp;
+  }
+
+  // Critério 2: URL + método + timestamp próximo (fallback temporal)
   return existing.find((r) =>
     r.url    === newReq.url &&
     r.method === newReq.method &&
-    Math.abs(r.timestamp - newReq.timestamp) < 500,
+    Math.abs(r.timestamp - newReq.timestamp) < 300,
   ) ?? null;
 }
 
@@ -224,7 +284,10 @@ export function mergeWithDevtools(target, devtoolsReq) {
   if (devtoolsReq.transferSize >= 0) target.transferSize = devtoolsReq.transferSize;
   if (devtoolsReq.responseSize >= 0) target.responseSize = devtoolsReq.responseSize;
   if (devtoolsReq.spHint)       target.spHint       = devtoolsReq.spHint;
-  if (devtoolsReq.initiator)    target.initiator    = devtoolsReq.initiator;
+  // Preferir o initiator do DevTools (tem frames completos) sobre o do content (sem frames)
+  if (devtoolsReq.initiator && (devtoolsReq.initiator.frames?.length ?? 0) > 0) {
+    target.initiator = devtoolsReq.initiator;
+  }
   if (devtoolsReq.resourceType) target.resourceType = devtoolsReq.resourceType;
 
   // Marca a entrada como enriquecida para fins de diagnóstico no relatório

@@ -278,7 +278,28 @@ export function classifyRequest(request) {
     parsedPayload?.businessFields?.serviceName ||
     parsedPayload?.businessFields?.servicename;
 
-  const serviceCategory = classifyByServiceName(serviceName);
+  // E3: usa requestType (inferido pelo parser) para classificação mais precisa
+  // que o match textual do serviceName — tem precedência quando disponível
+  const requestType = parsedPayload?.requestType;
+  let serviceCategory = null;
+  if (requestType && requestType !== 'UNKNOWN') {
+    switch (requestType) {
+      case 'LOAD_GRID':      serviceCategory = CATEGORIES.QUERY;    break;
+      case 'SAVE_RECORD':    serviceCategory = CATEGORIES.PERSIST;  break;
+      case 'DELETE_RECORD':  serviceCategory = CATEGORIES.PERSIST;  break;
+      case 'EXECUTE_ACTION': serviceCategory = CATEGORIES.BUSINESS; break;
+      case 'CALL_SP':        serviceCategory = CATEGORIES.BUSINESS; break;
+      case 'CALL_LISTENER':  serviceCategory = CATEGORIES.BUSINESS; break;
+      case 'OPEN_FORM':      serviceCategory = CATEGORIES.QUERY;    break;
+      case 'LOAD_FORM':      serviceCategory = CATEGORIES.QUERY;    break;
+      default: break;
+    }
+  }
+
+  // Fallback: classificação textual por serviceName (mantém compatibilidade)
+  if (!serviceCategory) {
+    serviceCategory = classifyByServiceName(serviceName);
+  }
 
   if (serviceCategory) {
     // Só sobrescreve a categoria se ainda não for CRITICAL

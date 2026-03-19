@@ -36,6 +36,112 @@
   const MAX_BODY_LEN = 8192;
 
   // ---------------------------------------------------------------------------
+  // E1 — Captura de call stack
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Parseia uma string de stack trace (new Error().stack) e extrai os frames
+   * relevantes, filtrando ruído da extensão e de módulos internos.
+   *
+   * @param {string} raw  string bruta de new Error().stack
+   * @returns {Array<{fn:string, file:string, line:number, col:number}>|null}
+   */
+  function parseStack(raw) {
+    if (!raw || typeof raw !== 'string') return null;
+    const frames = [];
+    // Suporta dois formatos: "at fn (file:line:col)" e "at file:line:col"
+    const re = /at (?:(.+?) \((.+?):(\d+):(\d+)\)|(.+?):(\d+):(\d+))/g;
+    let m;
+    while ((m = re.exec(raw)) !== null && frames.length < 12) {
+      const fn   = m[1] || '(anonymous)';
+      const file = m[2] || m[5] || '';
+      const line = parseInt(m[3] || m[6] || '0', 10);
+      const col  = parseInt(m[4] || m[7] || '0', 10);
+      // Filtra ruído: própria extensão, node_modules, webpack internals, e este próprio script
+      if (/chrome-extension:|node_modules|webpack-internal:|parseStack|MonitorXHR/.test(file)) continue;
+      if (fn === 'parseStack') continue;
+      frames.push({ fn, file, line, col });
+    }
+    return frames.length ? frames : null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // E8 — Timeline de ação do usuário
+  // ---------------------------------------------------------------------------
+
+  /** Buffer circular de eventos de UI — máx 50 entradas. */
+  const UI_EVENTS = [];
+  const UI_EVENTS_MAX = 50;
+
+  /**
+   * Captura um evento DOM seguro (sem dados sensíveis) e o armazena no buffer.
+   * Ignora campos de senha e elementos marcados como data-sensitive.
+   */
+  function captureUIEvent(e) {
+    try {
+      const el = e.target;
+      if (!el) return;
+      // Segurança: ignora campos de senha e elementos sensíveis (OWASP A02)
+      if (el.type === 'password' || el.closest('[data-sensitive]')) return;
+      // Para keydown, só captura teclas funcionais (Enter, F2, F5, Escape)
+      if (e.type === 'keydown' && ![13, 116, 9, 27, 113].includes(e.keyCode)) return;
+
+      const entry = {
+        type: e.type,
+        ts:   Date.now(),
+        tag:  el.tagName?.toLowerCase() || '',
+        id:   el.id ? String(el.id).substring(0, 60) : '',
+        name: el.name ? String(el.name).substring(0, 60) : '',
+        cls:  el.className ? String(el.className).substring(0, 80) : '',
+        text: el.innerText ? el.innerText.substring(0, 40).trim() : '',
+        data: el.dataset
+          ? Object.fromEntries(Object.entries(el.dataset).slice(0, 5).map(([k, v]) => [k, String(v).substring(0, 60)]))
+          : {},
+      };
+
+      if (UI_EVENTS.length >= UI_EVENTS_MAX) UI_EVENTS.shift();
+      UI_EVENTS.push(entry);
+    } catch (_) { /* nunca interrompe a aplicação */ }
+  }
+
+  // Registra listeners de eventos do usuário na fase de captura (bubbling completo)
+  ['click', 'change', 'submit', 'keydown'].forEach((evType) => {
+    document.addEventListener(evType, captureUIEvent, true);
+  });
+
+  // ---------------------------------------------------------------------------
+  // E8 — Snapshot de contexto de tela
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Captura um snapshot do contexto visual atual da tela Sankhya (SPA).
+   * @returns {{ url:string, title:string, hash:string, breadcrumbs:string[] }}
+   */
+  function captureScreenSnapshot() {
+    try {
+      const breadcrumbs = [
+        ...document.querySelectorAll('.breadcrumb li, [class*=breadcrumb] li, nav ol li'),
+      ]
+        .map((el) => el.innerText?.trim())
+        .filter(Boolean)
+        .slice(0, 6);
+
+      return {
+        url:         location.href,
+        title:       document.title,
+        hash:        location.hash,
+        breadcrumbs,
+      };
+    } catch (_) {
+      return { url: location.href, title: '', hash: location.hash, breadcrumbs: [] };
+    }
+  }
+
+  /** Snapshot atual — atualizado ao mudar rota (SPA hashchange). */
+  let currentSnapshot = captureScreenSnapshot();
+  window.addEventListener('hashchange', () => { currentSnapshot = captureScreenSnapshot(); });
+
+  // ---------------------------------------------------------------------------
   // Filtros rápidos (executados no MAIN world para não sobrecarregar o bridge)
   // ---------------------------------------------------------------------------
 
@@ -100,12 +206,16 @@
         startTime:      0,
         requestHeaders: {},
         requestBody:    null,
+        callStack:      null,
       };
     }
 
     open(method, url, ...rest) {
-      this._mon.method = (method || 'GET').toUpperCase();
-      this._mon.url    = url ? String(url) : '';
+      this._mon.method    = (method || 'GET').toUpperCase();
+      this._mon.url       = url ? String(url) : '';
+      // E1: captura call stack no momento do open() — antes do super.open()
+      // para que o stack ainda reflita o código da aplicação, não internos do browser
+      this._mon.callStack = parseStack(new Error().stack);
       return super.open(method, url, ...rest);
     }
 
@@ -169,6 +279,11 @@
             timestamp:       mon.startTime,
             requestHeaders:  mon.requestHeaders,
             responseHeaders,
+            // E1: stack de chamadas capturado no open()
+            callStack:       mon.callStack,
+            // E8: contexto do usuário e da tela
+            uiContext:       UI_EVENTS.slice(-5).filter((ev) => ev.ts > Date.now() - 5000),
+            screenContext:   currentSnapshot,
           });
         } catch (_) { /* nunca interrompe a aplicação */ }
       });
@@ -217,6 +332,12 @@
     }
 
     const startTime = Date.now();
+    // E1: captura call stack antes de sair para o browser — enquanto o stack
+    // ainda contém frames do código da aplicação Sankhya
+    const fetchCallStack  = parseStack(new Error().stack);
+    // E8: snapshot de eventos e tela no momento do disparo do fetch
+    const fetchUiContext  = UI_EVENTS.slice(-5).filter((ev) => ev.ts > Date.now() - 5000);
+    const fetchScreenCtx  = currentSnapshot;
 
     let response;
     try {
@@ -228,6 +349,7 @@
         statusCode: 0, duration: Date.now() - startTime,
         timestamp: startTime, requestHeaders: reqHeaders,
         responseHeaders: {}, networkError: String(networkError),
+        callStack: fetchCallStack, uiContext: fetchUiContext, screenContext: fetchScreenCtx,
       });
       throw networkError;
     }
@@ -252,6 +374,10 @@
         duration, timestamp: startTime,
         requestHeaders:  reqHeaders,
         responseHeaders: respHeaders,
+        // E1 + E8
+        callStack:       fetchCallStack,
+        uiContext:       fetchUiContext,
+        screenContext:   fetchScreenCtx,
       });
     }).catch(() => { /* body não legível (ex: binário) */ });
 

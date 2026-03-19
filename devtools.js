@@ -56,8 +56,34 @@ function extractTiming(timings) {
 }
 
 /**
- * Recebe cada requisição finalizada pelo DevTools Network panel.
- * @param {chrome.devtools.network.Request} entry  Objeto HAR (HTTP Archive)
+ * E1 — Extrai initiator completo do HAR, incluindo todos os frames da call stack.
+ *
+ * O DevTools expõe `entry._initiator` com dois subtipos principais:
+ *  - type='script': a requisição foi disparada por código JS → tem `stack.callFrames`
+ *  - type='parser': a requisição veio de um link/src no HTML → sem frames úteis
+ *
+ * @param {Object|null} initiator  entry._initiator do HAR
+ * @returns {{ type:string, topFrame:Object|null, frames:Object[] }|null}
+ */
+function extractInitiator(initiator) {
+  if (!initiator) return null;
+
+  const frames = (initiator.stack?.callFrames || []).map((f) => ({
+    fn:   f.functionName || '(anonymous)',
+    file: f.url           || '',
+    line: f.lineNumber    ?? 0,
+    col:  f.columnNumber  ?? 0,
+  }));
+
+  return {
+    type:     initiator.type  || 'other',
+    url:      initiator.url   || null,
+    topFrame: frames[0] ?? null,
+    frames,
+  };
+}
+
+
  */
 chrome.devtools.network.onRequestFinished.addListener((entry) => {
   const req  = entry.request;
@@ -129,10 +155,8 @@ chrome.devtools.network.onRequestFinished.addListener((entry) => {
     spHint = /\bSP\./i.test(sn);
   } catch (_) {}
 
-  // Extrai initiator (quem disparou a requisição)
-  const initiator = entry._initiator
-    ? { type: entry._initiator.type, url: entry._initiator.url || null }
-    : null;
+  // E1: Extrai initiator completo com todos os frames da call stack quando disponíveis
+  const initiator = extractInitiator(entry._initiator);
 
   // Extrai response body de forma assíncrona (única forma possível no HAR)
   entry.getContent((responseBody, encoding) => {
@@ -175,3 +199,61 @@ chrome.devtools.network.onRequestFinished.addListener((entry) => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// E6 — Indexação de fontes (source indexing) ao navegar
+// ---------------------------------------------------------------------------
+// Quando a página é carregada/recarregada, varre os scripts para construir
+// um índice de padrões Sankhya. O índice é enviado ao background como
+// SOURCE_INDEX_READY para ser usado na correlação de hipóteses (E7).
+
+chrome.devtools.network.onNavigated.addListener(() => {
+  try {
+    // Executa no contexto da página inspecionada via eval assíncrono.
+    // A função auto-contida usa fetch + performance.getEntries — APIs
+    // que existem na página, não na DevTools page.
+    const evalScript = `(async function() {
+      const SOURCE_PATTERNS = [
+        { name: 'ServiceProxy.callService', re: 'ServiceProxy\\\\.callService' },
+        { name: 'callService',              re: 'callService\\\\s*\\\\(' },
+        { name: 'CRUDService',              re: 'CRUDService' },
+        { name: 'ActionExecutor',           re: 'ActionExecutor' },
+        { name: 'loadRecords',              re: 'loadRecords\\\\s*\\\\(' },
+        { name: 'openForm',                 re: 'openForm\\\\s*\\\\(' },
+        { name: 'serviceName:',             re: 'serviceName\\\\s*:' },
+        { name: 'application:',             re: 'application\\\\s*:' },
+      ];
+      const resources = performance.getEntriesByType('resource')
+        .filter(r => r.initiatorType === 'script' && r.name && r.name.startsWith('http') && !r.name.includes('chrome-extension'));
+      const results = {};
+      for (const res of resources.slice(0, 30)) {
+        try {
+          const resp = await fetch(res.name, { cache: 'force-cache' });
+          if (!resp.ok) continue;
+          const text = await resp.text();
+          if (text.length > 5000000) continue;
+          const lines = text.split('\\n');
+          for (const p of SOURCE_PATTERNS) {
+            const re = new RegExp(p.re, 'g');
+            lines.forEach((line, idx) => {
+              if (!results[p.name]) results[p.name] = [];
+              if (results[p.name].length >= 20) return;
+              if (re.test(line)) {
+                results[p.name].push({ file: res.name, lineNum: idx + 1, snippet: line.trim().substring(0, 120) });
+                re.lastIndex = 0;
+              }
+            });
+          }
+        } catch(_) {}
+      }
+      return JSON.stringify(results);
+    })()`;
+
+    chrome.devtools.inspectedWindow.eval(evalScript, { useContentScriptContext: false }, (result, isException) => {
+      if (isException || !result) return;
+      try {
+        const index = JSON.parse(typeof result === 'string' ? result : JSON.stringify(result));
+        chrome.runtime.sendMessage({ action: 'SOURCE_INDEX_READY', index }).catch(() => {});
+      } catch (_) {}
+    });
+  } catch (_) {}
+});
