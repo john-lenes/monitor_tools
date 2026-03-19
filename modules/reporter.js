@@ -24,6 +24,7 @@
 
 import { CATEGORIES } from './classifier.js';
 import { computeRelevanceScore, buildHypothesis } from './correlator.js';
+import { groupByFlow } from './flow-analyzer.js';
 
 // ---------------------------------------------------------------------------
 // Helper interno — extração de serviceName
@@ -589,13 +590,32 @@ export function generateTextReport(session) {
       if (req.classification?.isBottleneck) {
         lines.push(`       ⚡ GARGALO     : tempo acima de 2s — verificar processamento SP no servidor`);
       }
-      // E2: atribuição frontend quando disponível
+      // M3: captura direta via api-patch (antes da serialização HTTP)
+      const ac = req.apiCall;
+      if (ac) {
+        lines.push(`       API Patch     : ${ac.fn || '—'}  [Δ HTTP: ${ac.deltaMs != null ? ac.deltaMs + 'ms' : 'N/A'}]`);
+        if (ac.thisContext) lines.push(`       thisContext   : ${ac.thisContext}`);
+        const ownerFn = ac.callStack?.ownerFrame?.fn;
+        if (ownerFn) lines.push(`       ownerFrame    : ${ownerFn}`);
+      }
+      // E2/M9: atribuição frontend quando disponível
       const corr = req.correlation;
       if (corr?.frontendOwner) {
         const file = corr.frontendOwner.file.split('/').pop();
         const pct  = Math.round(corr.confidence * 100);
-        lines.push(`       Frontend      : ${file} → ${corr.frontendOwner.fn} (${pct}%)`);
-        lines.push(`       Padrão        : ${corr.frontendOwner.pattern}`);
+        const src  = corr.source ? ` [${corr.source}]` : '';
+        lines.push(`       Frontend      : ${file} → ${corr.frontendOwner.fn} (${pct}%)${src}`);
+        if (corr.ownerFrame?.fn)      lines.push(`       ownerFrame    : ${corr.ownerFrame.fn}`);
+        if (corr.dispatcherFrame?.fn) lines.push(`       dispatcher    : ${corr.dispatcherFrame.fn}`);
+      }
+      // M8: resumo de zones
+      const zones = req.parsedPayload?.zones;
+      if (zones) {
+        const zoneEntries = Object.entries(zones).filter(([, v]) => v && Object.keys(v).length);
+        if (zoneEntries.length) {
+          const zonesStr = zoneEntries.map(([z, fields]) => `${z}(${Object.keys(fields).join(',')})`).join('  ');
+          lines.push(`       Zones         : ${zonesStr}`);
+        }
       }
       // E5: hipótese de backend
       if (req.hypothesis?.hypothesis) {
@@ -685,6 +705,60 @@ export function generateTextReport(session) {
     lines.push(LINE_LIGHT);
     suggestions.forEach((s) => lines.push(`  • ${s}`));
     lines.push('');
+  }
+
+  // M10: Resumo dos fluxos funcionais
+  const flows = groupByFlow(requests);
+  if (flows.length) {
+    lines.push(LINE_LIGHT);
+    lines.push('FLUXOS FUNCIONAIS (M10)');
+    lines.push(LINE_LIGHT);
+    lines.push('');
+    flows.forEach((flow, fi) => {
+      const pe = flow.primaryError;
+      const pb = flow.primaryBottleneck;
+      const fh = flow.frontendHint;
+      const sc = flow.screenContext;
+
+      const flags = [
+        flow.hasCritical   ? '⚠ CRÍTICO'  : '',
+        flow.hasBottleneck ? '⚡ GARGALO'  : '',
+        flow.hasSP         ? '★ SP'        : '',
+      ].filter(Boolean).join('  ');
+
+      lines.push(`  #${String(fi+1).padStart(2)} ${flow.name || 'Fluxo'}`);
+      if (sc?.title) lines.push(`       Tela          : ${sc.title}${sc.hash ? ' (' + sc.hash + ')' : ''}`);
+      if (flow.application) lines.push(`       Application   : ${flow.application}`);
+      if (sc?.selectedContext?.pk) lines.push(`       PK selecionada: ${sc.selectedContext.pk}`);
+      lines.push(`       Chamadas      : ${flow.requests.length}  |  Duração: ${fmt(flow.duration||0)}`);
+      if (flags) lines.push(`       Flags         : ${flags}`);
+
+      if (fh?.fn || fh?.file) {
+        const fhPct = Math.round((fh.confidence||0)*100);
+        lines.push(`       Frontend hint : ${fh.fn || '—'} (${fhPct}% · ${fh.source||'—'})`);
+      }
+      if (pe) {
+        const peSN = extractServiceName(pe);
+        lines.push(`       Erro principal: ${peSN} — ${pe.parsedResponse?.errorMessage?.substring(0,80)||'erro reportado'}`);
+      }
+      if (pb) {
+        const pbSN = extractServiceName(pb);
+        lines.push(`       Gargalo princ.: ${pbSN} — ${fmt(pb.duration||0)}`);
+      }
+
+      // Árvore de chamadas (M10)
+      const tree = flow.tree || [];
+      if (tree.length) {
+        lines.push(`       Árvore:`);
+        tree.forEach((node) => {
+          const prefix = '         ' + '  '.repeat(node.depth || 0) + (node.isRoot ? '▶' : '↳');
+          const snNode = extractServiceName(node.req) || (node.req?.url ? new URL(node.req.url).pathname : '—');
+          const durNode = fmt(node.req?.duration || 0);
+          lines.push(`${prefix} ${snNode}  [${durNode}]`);
+        });
+      }
+      lines.push('');
+    });
   }
 
   lines.push(LINE_FULL);

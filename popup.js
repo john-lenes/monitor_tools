@@ -213,15 +213,19 @@ function buildCallItem(req) {
   if (crit)     catClass = 'tag-critical';
   else if (bot) catClass = 'tag-bottleneck';
 
-  // E2: badge de correlação frontend
+  // E2/M9: badge de correlação frontend com source
   let corrBadge = '';
   const corr = req.correlation;
   if (corr && (corr.confidence ?? 0) >= 0.5) {
-    const fname = corr.frontendOwner?.file?.split('/').pop() ?? corr.patternHint ?? '';
-    const pct   = Math.round((corr.confidence ?? 0) * 100);
+    const fname  = corr.frontendOwner?.file?.split('/').pop() ?? corr.patternHint ?? '';
+    const pct    = Math.round((corr.confidence ?? 0) * 100);
     const bColor = (corr.confidence ?? 0) >= 0.8 ? '#15803d' : '#a16207';
+    const srcIcon = corr.source === 'api-patch'  ? '⚡'
+                  : corr.source === 'callStack'  ? '📍'
+                  : corr.source === 'initiator'  ? '🔗'
+                  : '';
     corrBadge = fname
-      ? `<span style="font-size:10px;color:${bColor};font-weight:600;margin-left:4px">[${pct}%] ${escHtml(fname)}</span>`
+      ? `<span style="font-size:10px;color:${bColor};font-weight:600;margin-left:4px">${srcIcon}[${pct}%] ${escHtml(fname)}</span>`
       : '';
   }
 

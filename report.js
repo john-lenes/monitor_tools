@@ -511,14 +511,84 @@ function buildDetailContent(req) {
         const sc = req.screenContext;
         if (!sc) return '';
         const crumbs = (sc.breadcrumbs || []).join(' › ') || '—';
+        const rows = [
+          ['título',      sc.title     || '—'],
+          ['hash',        sc.hash      || '—'],
+          ['breadcrumb',  crumbs],
+          sc.activeTab    ? ['aba ativa',   sc.activeTab]                 : null,
+          sc.modalTitle   ? ['modal',       sc.modalTitle]                : null,
+          sc.formHints?.formId      ? ['form-id',     sc.formHints.formId]     : null,
+          sc.formHints?.resourceId  ? ['resource-id', sc.formHints.resourceId] : null,
+          sc.formHints?.application ? ['application', sc.formHints.application]: null,
+          sc.selectedContext?.entityName ? ['entidade',  sc.selectedContext.entityName]     : null,
+          sc.selectedContext?.pk         ? ['PK',        String(sc.selectedContext.pk)]      : null,
+          sc.selectedContext?.rowId      ? ['rowId',     String(sc.selectedContext.rowId)]   : null,
+        ].filter(Boolean);
         return `
       <div class="detail-block">
         <h4>🖥 Contexto da Tela</h4>
-        <ul class="kv-list">
-          <li><span class="k">título</span><span class="v">${escHtml(sc.title || '—')}</span></li>
-          <li><span class="k">hash</span><span class="v">${escHtml(sc.hash || '—')}</span></li>
-          <li><span class="k">breadcrumb</span><span class="v">${escHtml(crumbs)}</span></li>
-        </ul>
+        <ul class="kv-list">${rows.map(([k,v]) => `<li><span class="k">${escHtml(k)}</span><span class="v">${escHtml(String(v))}</span></li>`).join('')}</ul>
+      </div>`;
+      })()}
+      ${(() => {
+        const ac = req.apiCall;
+        if (!ac) return '';
+        const rows = [
+          ['fonte',       'api-patch (antes da serialização HTTP)'],
+          ['função',      ac.fn          || '—'],
+          ['serviceName', ac.serviceName || '—'],
+          ['application', ac.application || '—'],
+          ['resourceID',  ac.resourceID  || '—'],
+          ['thisContext', ac.thisContext  || '—'],
+          ac.deltaMs != null ? ['Δ HTTP (ms)', String(ac.deltaMs)] : null,
+          ac.rawArg ? ['rawArg', JSON.stringify(ac.rawArg).substring(0, 200)] : null,
+        ].filter(Boolean);
+        const stackLines = (ac.callStack?.frames || []).slice(0, 6)
+          .map((f) => `${f.fn || '(anon)'} @ ${(f.file || '').split('/').pop()}:${f.line || '?'}`)
+          .join('\n');
+        return `
+      <div class="detail-block">
+        <h4>⚡ API Patch (M1/M2) — Captura Direta</h4>
+        <ul class="kv-list">${rows.map(([k,v]) => `<li><span class="k">${escHtml(k)}</span><span class="v">${escHtml(String(v))}</span></li>`).join('')}</ul>
+        ${stackLines ? `<div class="code-block" style="margin-top:6px;font-size:10px">${escHtml(stackLines)}</div>` : ''}
+      </div>`;
+      })()}
+      ${(() => {
+        const zones = req.parsedPayload?.zones;
+        if (!zones) return '';
+        const nonEmpty = Object.entries(zones).filter(([, v]) => v && Object.keys(v).length > 0);
+        if (!nonEmpty.length) return '';
+        const parts = nonEmpty.map(([zone, fields]) => {
+          const pairs = Object.entries(fields).map(([k, v]) =>
+            `<li><span class="k">${escHtml(zone)}.${escHtml(k)}</span><span class="v">${escHtml(String(v))}</span></li>`
+          ).join('');
+          return pairs;
+        }).join('');
+        return `
+      <div class="detail-block">
+        <h4>🗂 Payload Zones (M8)</h4>
+        <ul class="kv-list">${parts}</ul>
+      </div>`;
+      })()}
+      ${(() => {
+        const corr = req.correlation;
+        const ownerFrame      = corr?.ownerFrame;
+        const dispatcherFrame = corr?.dispatcherFrame;
+        if (!ownerFrame && !dispatcherFrame) return '';
+        const src   = corr?.source || '—';
+        let rows = [['fonte atribuição', src]];
+        if (ownerFrame) {
+          rows.push(['ownerFrame fn',   ownerFrame.fn   || '(anon)']);
+          rows.push(['ownerFrame file', (ownerFrame.file || '').split('/').pop() + ':' + (ownerFrame.line || '?')]);
+        }
+        if (dispatcherFrame) {
+          rows.push(['dispatcherFrame fn',   dispatcherFrame.fn   || '(anon)']);
+          rows.push(['dispatcherFrame file', (dispatcherFrame.file || '').split('/').pop() + ':' + (dispatcherFrame.line || '?')]);
+        }
+        return `
+      <div class="detail-block">
+        <h4>🔎 Stack Frames (M9)</h4>
+        <ul class="kv-list">${rows.map(([k,v]) => `<li><span class="k">${escHtml(k)}</span><span class="v">${escHtml(String(v))}</span></li>`).join('')}</ul>
       </div>`;
       })()}
       ${errorSection}
@@ -563,6 +633,38 @@ function renderFlowTimeline(flows) {
       triggerText = `${txt}`;
     }
 
+    // M10: frontendHint, primaryError, primaryBottleneck, tree
+    const fh  = flow.frontendHint;
+    const pe  = flow.primaryError;
+    const pb  = flow.primaryBottleneck;
+    const tree = flow.tree || [];
+
+    const frontendHintHtml = fh
+      ? `<div style="font-size:11px;color:#15803d;margin:4px 0 0 4px">⚡ ${escHtml(fh.fn || fh.file || '?')} [${Math.round((fh.confidence||0)*100)}% · ${escHtml(fh.source||'')}]</div>`
+      : '';
+    const primaryErrorHtml = pe
+      ? `<div style="font-size:11px;color:var(--danger);margin:2px 0 0 4px">⚠ Erro principal: ${escHtml(extractSN(pe))} — ${escHtml(pe.parsedResponse?.errorMessage?.substring(0,80)||'erro reportado')}</div>`
+      : '';
+    const primaryBottleneckHtml = pb
+      ? `<div style="font-size:11px;color:#f59e0b;margin:2px 0 0 4px">⚡ Gargalo principal: ${escHtml(extractSN(pb))} — ${fmtDuration(pb.duration||0)}</div>`
+      : '';
+
+    // Build tree rows (indented by depth)
+    const treeRows = tree.length ? tree.map((node) => {
+      const indent = '&nbsp;&nbsp;&nbsp;&nbsp;'.repeat(node.depth || 0);
+      const icon   = node.isRoot ? '▶' : '↳';
+      const sn2    = escHtml(extractSN(node.req));
+      const rt2    = escHtml(String(node.req?.parsedPayload?.requestType ?? '—'));
+      const dur2   = fmtDuration(node.req?.duration || 0);
+      const tCls2  = timeClass(node.req?.duration || 0);
+      return `<tr>
+        <td>${indent}${icon}</td>
+        <td>${sn2}</td>
+        <td>${rt2}</td>
+        <td><span class="time-badge time-${tCls2}">${dur2}</span></td>
+      </tr>`;
+    }).join('') : null;
+
     const innerRows = (flow.requests || []).map((req) => {
       const sn  = req.queryParams?.serviceName
                || req.parsedPayload?.businessFields?.serviceName
@@ -588,6 +690,14 @@ function renderFlowTimeline(flows) {
         ${critBadge}${botBadge}${spBadge}
         ${flow.application ? `<span style="font-size:11px;color:var(--muted)">app: ${escHtml(flow.application)}</span>` : ''}
       </summary>
+      ${frontendHintHtml}${primaryErrorHtml}${primaryBottleneckHtml}
+      ${treeRows ? `
+      <h5 style="margin:8px 0 4px 4px;font-size:11px;color:var(--muted)">Árvore de chamadas (M10)</h5>
+      <table class="call-table" style="margin:0 0 8px 16px;font-size:11px">
+        <thead><tr><th></th><th>serviceName</th><th>Tipo</th><th>Tempo</th></tr></thead>
+        <tbody>${treeRows}</tbody>
+      </table>` : ''}
+      <h5 style="margin:4px 0 4px 4px;font-size:11px;color:var(--muted)">Sequência HTTP</h5>
       <table class="call-table" style="margin:8px 0 0 16px">
         <thead><tr><th>Hora</th><th>Método</th><th>serviceName</th><th>Tipo</th><th>Tempo</th></tr></thead>
         <tbody>${innerRows}</tbody>
@@ -742,6 +852,15 @@ function timeClass(ms) {
   if (ms >= 2000) return 'slow';
   if (ms >= 500)  return 'medium';
   return 'fast';
+}
+
+/** Extrai serviceName de um request (usado em renderFlowTimeline). */
+function extractSN(req) {
+  if (!req) return '—';
+  return req.queryParams?.serviceName
+      || req.parsedPayload?.businessFields?.serviceName
+      || req.parsedPayload?.businessFields?.servicename
+      || '—';
 }
 
 function statusLabel(s) {
