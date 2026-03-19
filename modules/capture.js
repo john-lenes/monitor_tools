@@ -59,7 +59,7 @@ export function generateRequestId() {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// E4 — Fingerprint de requisição
+// M7 / E4 — Fingerprint de requisição (dois níveis: ocorrência e padrão funcional)
 // ---------------------------------------------------------------------------
 
 /**
@@ -69,11 +69,11 @@ export function generateRequestId() {
 const _FP_IGNORE_PARAMS = new Set(['mgesession', 'outputtype', '_', 'jsessionid', 'token']);
 
 /**
- * Calcula um fingerprint rápido para a requisição bruta.
+ * Calcula o fingerprint de OCORRÊNCIA — identifica duas capturas da MESMA requisição
+ * (ex: content-main + devtools do mesmo XHR). Inclui transactionId e initiator.topFrame
+ * para distinguir chamadas em cascata do mesmo serviço com payloads diferentes.
  *
- * Composto por: método + URL normalizada (sem params de sessão) + serviceName + hash do body.
- * Duas chamadas ao mesmo serviço com payloads diferentes (nunota diferente) geram
- * fingerprints diferentes e NÃO serão colapsadas como duplicatas.
+ * Dois fingerprints idênticos = mesma ocorrência → merge (não adicionar).
  *
  * @param {Object} raw  dados brutos da requisição
  * @returns {string}
@@ -86,7 +86,6 @@ function computeFingerprint(raw) {
   try {
     const u = new URL(normalizedUrl.startsWith('http') ? normalizedUrl : `https://x.com${normalizedUrl}`);
     _FP_IGNORE_PARAMS.forEach((p) => u.searchParams.delete(p));
-    // Extrai serviceName para incluir no fingerprint diretamente
     normalizedUrl = u.pathname + (u.searchParams.toString() ? '?' + u.searchParams.toString() : '');
   } catch (_) { /* URL malformada — usa bruta */ }
 
@@ -97,13 +96,61 @@ function computeFingerprint(raw) {
     sn = u2.searchParams.get('serviceName') || u2.searchParams.get('servicename') || '';
   } catch (_) {}
 
+  // M7: inclui application e resourceID no fingerprint quando presentes
+  let app = '';
+  let rid = '';
+  try {
+    const u3 = new URL((raw.url || '').startsWith('http') ? raw.url : `https://x.com${raw.url}`);
+    app = u3.searchParams.get('application') || u3.searchParams.get('Application') || '';
+    rid = u3.searchParams.get('resourceID')  || u3.searchParams.get('resourceId')  || '';
+  } catch (_) {}
+
   // Hash simples do body (soma de char codes dos primeiros 512 chars mod 65536)
   const body = raw.requestBody || '';
   let bodyHash = 0;
   const limit = Math.min(body.length, 512);
   for (let i = 0; i < limit; i++) bodyHash = (bodyHash + body.charCodeAt(i)) % 65536;
 
-  return `${method}|${normalizedUrl}|${sn}|${bodyHash}`;
+  // M7: inclui topFrame do initiator para diferenciar cascatas do mesmo serviço
+  const topFrameFile = raw.initiator?.topFrame?.file
+    ? raw.initiator.topFrame.file.split('/').pop().split('?')[0].substring(0, 40)
+    : '';
+
+  // M7: transactionId se presente no body (distingue transações distintas)
+  let txId = '';
+  try {
+    if (body) {
+      const bodyTx = body.match(/"transactionid"\s*:\s*"([^"]{1,40})"/i);
+      if (bodyTx) txId = bodyTx[1];
+    }
+  } catch (_) {}
+
+  return `${method}|${normalizedUrl}|${sn}|${app}|${rid}|${bodyHash}|${topFrameFile}|${txId}`;
+}
+
+/**
+ * Calcula o fingerprint de PADRÃO FUNCIONAL — identifica chamadas parecidas mas não iguais
+ * (ex: dois CRUDService.loadRecords com filtros diferentes). Menos granular que o fingerprint
+ * de ocorrência, usado para detectar "mesmo padrão funcional" sem colapsar como duplicata.
+ *
+ * @param {Object} raw
+ * @returns {string}
+ */
+function computeFunctionalPattern(raw) {
+  const method = (raw.method || 'GET').toUpperCase();
+  let path = '';
+  try {
+    const u = new URL((raw.url || '').startsWith('http') ? raw.url : `https://x.com${raw.url}`);
+    path = u.pathname;
+  } catch (_) { path = String(raw.url || '').split('?')[0]; }
+
+  let sn = '';
+  try {
+    const u = new URL((raw.url || '').startsWith('http') ? raw.url : `https://x.com${raw.url}`);
+    sn = u.searchParams.get('serviceName') || u.searchParams.get('servicename') || '';
+  } catch (_) {}
+
+  return `${method}|${path}|${sn}`;
 }
 
 /**
@@ -157,12 +204,13 @@ export function normalizeRequest(raw, source = 'content') {
     initiator:       raw.initiator     ?? null,   // { type, url, topFrame, frames[] } — quem disparou a requisição
     resourceType:    raw.resourceType  ?? null,   // tipo Chrome: 'xhr', 'fetch', 'document', etc.
     // E1: stack de chamadas do código da aplicação no momento do open()/fetch()
-    callStack:       raw.callStack     ?? null,   // [{ fn, file, line, col }]
+    callStack:       raw.callStack     ?? null,   // { frames, rawStack, ownerFrame }
     // E8: contexto de UI e tela
     uiContext:       raw.uiContext     ?? null,   // últimos 5 eventos DOM antes da requisição
-    screenContext:   raw.screenContext ?? null,   // { url, title, hash, breadcrumbs }
-    // E4: fingerprint para deduplicação robusta
-    fingerprint:     computeFingerprint(raw),
+    screenContext:   raw.screenContext ?? null,   // { url, title, hash, breadcrumbs, activeTab, ... }
+    // M7: fingerprint de ocorrência (para dedup) e de padrão funcional (para agrupamento)
+    fingerprint:        computeFingerprint(raw),
+    functionalPattern:  computeFunctionalPattern(raw),
   };
 }
 
@@ -211,24 +259,30 @@ function truncate(value, maxLen) {
  * Encontra a entrada existente que corresponde à nova requisição.
  * Retorna a entrada ou null (null = não é duplicata, deve ser adicionada).
  *
- * Critério de duplicata (em ordem de prioridade):
- *  1. Fingerprint idêntico (URL normalizada + método + serviceName + hash de body)
- *     — garante que payloads diferentes (nunota diferente) NÃO colidam.
- *  2. URL + método + Δt < 300ms (fallback quando ambas as partes não têm fingerprint)
- *     — cobre o delta entre a captura content-script e DevTools.
+ * M7 — Dois levels de deduplicação:
+ *
+ *  Nível 1 — MESMA OCORRÊNCIA (merge content + devtools do mesmo XHR):
+ *   a. Fingerprint de ocorrência idêntico (método+URL+sn+app+rid+bodyHash+topFrame+txId)
+ *   b. URL + método + Δt < 300ms (fallback temporal)
+ *
+ *  Nível 2 — MESMO PADRÃO FUNCIONAL (informativo, não descarta):
+ *   Não deduplicamos — chamadas parecidas com payload diferente (nunota diferente,
+ *   loads de refresh pós-save, contextos diferentes) são MANTIDAS SEPARADAS.
+ *   O padrão funcional fica disponível em `functionalPattern` para agrupamento
+ *   no flow-analyzer e reporter.
  *
  * @param {Object}   newReq     request normalizado recém chegado
  * @param {Object[]} existing   lista de requests já salvos na sessão atual
- * @returns {Object|null}  entrada existente ou null
+ * @returns {Object|null}  entrada existente (mesma ocorrência) ou null
  */
 export function findDuplicate(newReq, existing = []) {
-  // Critério 1: fingerprint idêntico (mais robusto — distingue payloads diferentes)
+  // Nível 1a: fingerprint de ocorrência idêntico (mais robusto)
   if (newReq.fingerprint) {
     const byFp = existing.find((r) => r.fingerprint && r.fingerprint === newReq.fingerprint);
     if (byFp) return byFp;
   }
 
-  // Critério 2: URL + método + timestamp próximo (fallback temporal)
+  // Nível 1b: URL + método + timestamp próximo (fallback temporal — cobre o delta content/devtools)
   return existing.find((r) =>
     r.url    === newReq.url &&
     r.method === newReq.method &&

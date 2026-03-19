@@ -83,8 +83,6 @@ function extractInitiator(initiator) {
   };
 }
 
-
- */
 chrome.devtools.network.onRequestFinished.addListener((entry) => {
   const req  = entry.request;
   const resp = entry.response;
@@ -200,17 +198,19 @@ chrome.devtools.network.onRequestFinished.addListener((entry) => {
 });
 
 // ---------------------------------------------------------------------------
-// E6 — Indexação de fontes (source indexing) ao navegar
+// E6 / M5 — Indexação de fontes (source indexing) ao navegar
 // ---------------------------------------------------------------------------
-// Quando a página é carregada/recarregada, varre os scripts para construir
-// um índice de padrões Sankhya. O índice é enviado ao background como
-// SOURCE_INDEX_READY para ser usado na correlação de hipóteses (E7).
+// M5: além de regex simples, captura blocos contextuais (20-40 linhas ao redor),
+// nome da função externa, string literals próximas (serviceName/application/resourceID)
+// e variáveis envolvidas. O indexador tem duas camadas:
+//   1. Triagem por regex rápida (igual ao anterior)
+//   2. Extração contextual de bloco (novo) — 20 linhas antes + 20 depois
+// O resultado inclui: file, lineNum, snippet (linha exata), context (bloco),
+// outerFn (função que contém o match), literals (strings/values próximos).
 
 chrome.devtools.network.onNavigated.addListener(() => {
   try {
     // Executa no contexto da página inspecionada via eval assíncrono.
-    // A função auto-contida usa fetch + performance.getEntries — APIs
-    // que existem na página, não na DevTools page.
     const evalScript = `(async function() {
       const SOURCE_PATTERNS = [
         { name: 'ServiceProxy.callService', re: 'ServiceProxy\\\\.callService' },
@@ -221,25 +221,73 @@ chrome.devtools.network.onNavigated.addListener(() => {
         { name: 'openForm',                 re: 'openForm\\\\s*\\\\(' },
         { name: 'serviceName:',             re: 'serviceName\\\\s*:' },
         { name: 'application:',             re: 'application\\\\s*:' },
+        { name: 'saveForm',                 re: 'saveForm\\\\s*\\\\(' },
+        { name: 'notifyListeners',          re: 'notifyListeners\\\\s*\\\\(' },
       ];
+
+      /**
+       * Extrai string literals e identificadores de negócio próximos ao match.
+       * Busca serviceName:'...', application:'...', resourceID, entityName, etc.
+       */
+      function extractLiterals(block) {
+        const literals = {};
+        const patterns = [
+          ['serviceName', /serviceName\\s*[:=]\\s*['"\\x60]([^'"\\x60]{1,100})/i],
+          ['application',  /application\\s*[:=]\\s*['"\\x60]([^'"\\x60]{1,80})/i],
+          ['resourceID',   /resourceID\\s*[:=]\\s*['"\\x60]([^'"\\x60]{1,80})/i],
+          ['entityName',   /entityName\\s*[:=]\\s*['"\\x60]([^'"\\x60]{1,80})/i],
+        ];
+        for (const [k, re] of patterns) {
+          const m = block.match(re);
+          if (m) literals[k] = m[1];
+        }
+        return Object.keys(literals).length ? literals : null;
+      }
+
+      /**
+       * Tenta encontrar o nome da função externa que contém o match.
+       * Busca para trás (linhas anteriores) por "function Nome" ou "Nome = function" ou "Nome: function".
+       */
+      function findOuterFunction(lines, matchIdx) {
+        const fnRe = /(?:function\\s+(\\w+)|(?:^|\\s)(\\w+)\\s*[:=]\\s*(?:async\\s+)?function)/;
+        for (let i = matchIdx; i >= Math.max(0, matchIdx - 40); i--) {
+          const m = lines[i].match(fnRe);
+          if (m) return (m[1] || m[2] || '').trim().substring(0, 80) || null;
+        }
+        return null;
+      }
+
       const resources = performance.getEntriesByType('resource')
         .filter(r => r.initiatorType === 'script' && r.name && r.name.startsWith('http') && !r.name.includes('chrome-extension'));
       const results = {};
-      for (const res of resources.slice(0, 30)) {
+      for (const res of resources.slice(0, 40)) {
         try {
           const resp = await fetch(res.name, { cache: 'force-cache' });
           if (!resp.ok) continue;
           const text = await resp.text();
-          if (text.length > 5000000) continue;
+          if (text.length > 8000000) continue;
           const lines = text.split('\\n');
           for (const p of SOURCE_PATTERNS) {
             const re = new RegExp(p.re, 'g');
+            if (!results[p.name]) results[p.name] = [];
             lines.forEach((line, idx) => {
-              if (!results[p.name]) results[p.name] = [];
-              if (results[p.name].length >= 20) return;
+              if (results[p.name].length >= 30) return;
               if (re.test(line)) {
-                results[p.name].push({ file: res.name, lineNum: idx + 1, snippet: line.trim().substring(0, 120) });
                 re.lastIndex = 0;
+                // M5: bloco contextual de ±20 linhas
+                const start   = Math.max(0, idx - 20);
+                const end     = Math.min(lines.length - 1, idx + 20);
+                const context = lines.slice(start, end + 1).join('\\n').substring(0, 3000);
+                const outerFn = findOuterFunction(lines, idx);
+                const literals = extractLiterals(context);
+                results[p.name].push({
+                  file:     res.name,
+                  lineNum:  idx + 1,
+                  snippet:  line.trim().substring(0, 200),
+                  context,
+                  outerFn,
+                  literals,
+                });
               }
             });
           }

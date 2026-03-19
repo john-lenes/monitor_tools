@@ -80,6 +80,82 @@ const STORAGE_FLUSH_MS = 400; // intervalo máximo de delay entre writes
  */
 let _sourceIndex = null;
 
+// ---------------------------------------------------------------------------
+// M3 — Fila de chamadas API internas Sankhya (correlação temporal forte)
+// ---------------------------------------------------------------------------
+//
+// Quando o content-main.js patcha ServiceProxy.callService, CRUDService.*, etc.,
+// emite um evento SANKHYA_API_CALL_CAPTURED que chega aqui ANTES da requisição HTTP
+// (porque o patch executa no mesmo microtask que a chamada de função, enquanto a
+// rede ainda não saiu).
+//
+// Guardamos em _apiCallQueue por até 2s. Quando chega a requisição HTTP,
+// tentamos casá-la com o evento mais recente por: serviceName + application + tempo.
+
+const API_CALL_QUEUE_TTL_MS   = 2000; // TTL de entradas na fila
+const API_CALL_QUEUE_MAX      = 50;   // máximo de entradas simultâneas
+
+/** @type {Array<{fn, serviceName, application, resourceID, callStack, uiContext, screenContext, ts, rawArg, thisContext}>} */
+let _apiCallQueue = [];
+
+/**
+ * Adiciona uma chamada API interna à fila de correlação.
+ * Remove entradas expiradas antes de adicionar.
+ *
+ * @param {Object} apiCall  dados emitidos pelo content-main.js via MSG_TYPE_API
+ */
+function enqueueApiCall(apiCall) {
+  const now = Date.now();
+  // Remove entradas expiradas
+  _apiCallQueue = _apiCallQueue.filter((e) => now - e.ts < API_CALL_QUEUE_TTL_MS);
+  if (_apiCallQueue.length >= API_CALL_QUEUE_MAX) _apiCallQueue.shift();
+  _apiCallQueue.push({ ...apiCall, ts: apiCall.ts || now });
+}
+
+/**
+ * Tenta casar uma requisição HTTP normalizada com a chamada API interna mais recente.
+ * Critérios (em prioridade):
+ *  1. serviceName idêntico (caso ideal — capturado diretamente dos args)
+ *  2. application idêntica
+ *  3. proximidade temporal (Δt < 2s, a chamada API deve ser anterior ao HTTP)
+ *
+ * @param {Object} normalized  requisição HTTP normalizada
+ * @returns {Object|null}  entrada da fila mais compatível, ou null
+ */
+function matchApiCall(normalized) {
+  const now    = Date.now();
+  const httpSN = normalized.queryParams?.serviceName
+              ?? normalized.parsedPayload?.businessFields?.serviceName
+              ?? normalized.parsedPayload?.businessFields?.servicename
+              ?? null;
+  const httpApp = normalized.queryParams?.application
+               ?? normalized.parsedPayload?.businessFields?.application
+               ?? null;
+
+  // Candidatos: entradas dentro do TTL e anteriores ao request HTTP
+  const candidates = _apiCallQueue.filter((e) => {
+    const age = (normalized.timestamp || now) - e.ts;
+    return age >= 0 && age < API_CALL_QUEUE_TTL_MS;
+  });
+
+  if (!candidates.length) return null;
+
+  // Pontua cada candidato
+  let best = null, bestScore = -1;
+  for (const c of candidates) {
+    let score = 0;
+    if (httpSN  && c.serviceName  && httpSN  === c.serviceName)  score += 4;
+    if (httpApp && c.application  && httpApp === c.application)  score += 2;
+    // Penaliza candidatos temporalmente distantes (prefer mais recente)
+    const age = (normalized.timestamp || now) - c.ts;
+    score += Math.max(0, 2 - age / 1000); // até +2 por proximidade temporal
+    if (score > bestScore) { bestScore = score; best = c; }
+  }
+
+  // Só casa se score mínimo de 2 (ao menos um critério forte compatível)
+  return bestScore >= 2 ? best : null;
+}
+
 /**
  * Inicializa o cache lendo o storage UMA vez por vida do service worker.
  * Chamadas subsequentes retornam imediatamente (guard _cacheReady).
@@ -188,6 +264,44 @@ async function processAndStore(raw, source) {
   normalized.queryParams    = parseQueryParams(normalized.url);
   normalized.parsedPayload  = parsePayload(normalized.requestBody);
   normalized.parsedResponse = parseResponse(normalized.responseBody);
+
+  // [Passo 8.5] M3 — Correlação temporal com chamada API interna Sankhya.
+  // Tenta casar com a chamada ServiceProxy/CRUDService/etc. mais recente.
+  // Quando há match, enriquece com dados capturados ANTES da serialização HTTP:
+  //   - fn (ServiceProxy.callService)
+  //   - serviceName/application/resourceID dos argumentos originais
+  //   - callStack da função chamadora (mais limpo que o do XHR)
+  //   - thisContext (componente que originou)
+  try {
+    const apiMatch = matchApiCall(normalized);
+    if (apiMatch) {
+      normalized.apiCall = {
+        fn:          apiMatch.fn,
+        serviceName: apiMatch.serviceName,
+        application: apiMatch.application,
+        resourceID:  apiMatch.resourceID,
+        rawArg:      apiMatch.rawArg,
+        thisContext: apiMatch.thisContext,
+        callStack:   apiMatch.callStack,
+        uiContext:   apiMatch.uiContext,
+        screenContext: apiMatch.screenContext,
+        deltaMs:     (normalized.timestamp || Date.now()) - apiMatch.ts,
+      };
+      // Prefere dados de argumento direto (mais precisos que parse de URL/body)
+      if (apiMatch.serviceName && !normalized.queryParams?.serviceName) {
+        normalized.queryParams = normalized.queryParams || {};
+        normalized.queryParams.serviceName = apiMatch.serviceName;
+      }
+      if (apiMatch.application && !normalized.queryParams?.application) {
+        normalized.queryParams = normalized.queryParams || {};
+        normalized.queryParams.application = apiMatch.application;
+      }
+      // Prefere o callStack da API patch (capturado mais cedo, mais limpo)
+      if (apiMatch.callStack && !normalized.callStack) {
+        normalized.callStack = apiMatch.callStack;
+      }
+    }
+  } catch (_) { /* correlação é best-effort */ }
 
   // [Passo 9] Classificar — determina categoria funcional, criticidade e gargalos
   normalized.classification = classifyRequest(normalized);
@@ -335,6 +449,14 @@ async function handleMessage(message) {
     // ── Índice de fontes construído pelo devtools.js (E6) ───────────────────
     case 'SOURCE_INDEX_READY': {
       _sourceIndex = message.index ?? null;
+      return { received: true };
+    }
+
+    // ── M3: chamada API interna Sankhya capturada pelo content-main.js ───────
+    // Chega antes da requisição HTTP (patch síncrono). Guardada na fila de
+    // correlação temporal para ser casada com o request de rede seguinte.
+    case 'SANKHYA_API_CALL_CAPTURED': {
+      if (message.apiCall) enqueueApiCall(message.apiCall);
       return { received: true };
     }
     // ── Estado do monitoramento (consultado pelo content-bridge) ────────

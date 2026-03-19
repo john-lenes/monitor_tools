@@ -187,11 +187,60 @@ const BUSINESS_FIELDS_SET = new Set([
   'dtinc', 'dtalter',
   // Financeiro
   'vlrnota', 'nossonumero',
-  // E3 — Novos campos de contexto de tela e metadados
+  // E3 — Campos de contexto de tela e metadados
   'pk', 'formid', 'componentid', 'selectedtab', 'rowid',
   'metadata', 'servicemodule',
   'transactionid', 'correlationid',
+  // M8 — Campos de intenção de ação e registro selecionado
+  'selectedrow', 'selectedrows',
+  'dataset', 'filters', 'fieldset', 'fields',
+  'clientevent', 'tab', 'panel', 'viewer',
+  'form', 'record', 'keys', 'parameters',
+  'sessionstate', 'operationtype',
 ]);
+
+// ---------------------------------------------------------------------------
+// M8 — Extratores por "zona" do payload
+// ---------------------------------------------------------------------------
+
+/**
+ * ZONAS do payload Sankhya — agrupam os campos por semântica funcional.
+ * Facilita a análise do relatório e a geração de hipóteses de backend.
+ */
+const PAYLOAD_ZONES = {
+  /** Identidade do registro: PK, nuNotas, códigos primários */
+  identity: ['nunota', 'nufin', 'nuseq', 'numnota', 'pk', 'id', 'rowid', 'selectedrow', 'keys'],
+  /** Identidade da tela/formulário: qual tela e componente está ativo */
+  screen: ['formid', 'componentid', 'selectedtab', 'tab', 'panel', 'viewer', 'form'],
+  /** Intenção da ação: o que o usuário/sistema quer fazer */
+  intent: ['action', 'event', 'listener', 'method', 'operationtype', 'clientevent'],
+  /** Parâmetros operacionais: entidade, módulo, parâmetros da chamada */
+  operation: ['entityname', 'rootentity', 'servicemodule', 'application', 'parameters', 'record'],
+  /** Filtros e consulta: critérios de busca */
+  query: ['criteria', 'where', 'filters', 'fieldset', 'fields', 'offset', 'limit', 'orderby', 'dataset'],
+  /** Metadados: IDs de rastreamento, sessão */
+  metadata: ['transactionid', 'correlationid', 'sessionstate', 'metadata'],
+};
+
+/**
+ * Classifica os campos extraídos em zonas funcionais.
+ * Retorna um objeto com apenas as zonas que têm campos presentes.
+ *
+ * @param {Object} businessFields  campos extraídos por extractBusinessFields
+ * @returns {Object}  { identity: {}, screen: {}, intent: {}, ... }
+ */
+function classifyIntoZones(businessFields) {
+  const zones = {};
+  for (const [zone, keys] of Object.entries(PAYLOAD_ZONES)) {
+    const zoneObj = {};
+    for (const k of keys) {
+      const val = businessFields[k] ?? businessFields[k.toLowerCase()] ?? businessFields[k.toUpperCase()];
+      if (val != null && val !== '') zoneObj[k] = val;
+    }
+    if (Object.keys(zoneObj).length) zones[zone] = zoneObj;
+  }
+  return Object.keys(zones).length ? zones : null;
+}
 
 /**
  * Percorre recursivamente um objeto JSON e coleta todos os campos de
@@ -301,13 +350,12 @@ export function parsePayload(body) {
     businessFields: {},
     requestType:    REQUEST_TYPE.UNKNOWN,
     transactionId:  null,  // E3/E4: exposto no topo para uso pelo fingerprint
+    zones:          null,  // M8: campos classificados por zona funcional
   };
 
   if (!body || typeof body !== 'string') return result;
 
   // Preserva os primeiros 1200 chars do body para exibição no relatório.
-  // 1200 chars cobrem a maioria dos payloads Sankhya (data= + JSON aninhado)
-  // sem inflar desnecessariamente o storage.
   result.raw = body.substring(0, 1200);
 
   // [TENTATIVA 1] JSON puro — APIs REST, chamadas modernas
@@ -315,10 +363,10 @@ export function parsePayload(body) {
     const json = JSON.parse(body);
     result.parsed = json;
     result.businessFields = extractBusinessFields(json);
-    // E3: infere tipo funcional e extrai transactionId para o topo
     const sn = result.businessFields.serviceName ?? result.businessFields.servicename ?? null;
     result.requestType   = inferRequestType(sn, result.businessFields);
     result.transactionId = result.businessFields.transactionid ?? result.businessFields.transactionId ?? null;
+    result.zones         = classifyIntoZones(result.businessFields); // M8
     return result;
   } catch (_) { /* não é JSON — tenta próximo formato */ }
 
@@ -329,7 +377,6 @@ export function parsePayload(body) {
     params.forEach((v, k) => { flat[k] = v; });
 
     // [TENTATIVA 2] Formato Sankhya Web: campo "data" contém JSON URL-encoded
-    // Este é o formato padrão de TODAS as chamadas do cliente web Sankhya.
     if (flat.data) {
       try {
         const inner = JSON.parse(decodeURIComponent(flat.data));
@@ -338,12 +385,12 @@ export function parsePayload(body) {
         const sn2 = result.businessFields.serviceName ?? result.businessFields.servicename ?? flat.serviceName ?? null;
         result.requestType   = inferRequestType(sn2, result.businessFields);
         result.transactionId = result.businessFields.transactionid ?? result.businessFields.transactionId ?? null;
+        result.zones         = classifyIntoZones(result.businessFields); // M8
         return result;
       } catch (_) { /* campo "data" não é JSON — cai no fallback */ }
     }
 
-    // [TENTATIVA 3] form-urlencoded simples — extrai campos diretamente
-    // Captura serviceName que pode vir fora do campo "data" em chamadas antigas
+    // [TENTATIVA 3] form-urlencoded simples
     if (flat.serviceName) {
       result.businessFields.serviceName = flat.serviceName;
     }
@@ -353,6 +400,7 @@ export function parsePayload(body) {
     const sn3 = result.businessFields.serviceName ?? result.businessFields.servicename ?? null;
     result.requestType   = inferRequestType(sn3, result.businessFields);
     result.transactionId = result.businessFields.transactionid ?? result.businessFields.transactionId ?? null;
+    result.zones         = classifyIntoZones(result.businessFields); // M8
   } catch (_) { /* body não é form-urlencoded — ignora sem propagar erro */ }
 
   return result;

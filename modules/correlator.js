@@ -152,26 +152,103 @@ const BACKEND_HYPOTHESIS_RULES = [
 // Funções auxiliares
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// M9 — Pontuação de frames do initiator/callStack
+// ---------------------------------------------------------------------------
+
+/** Padrões de libs genéricas — frames delas não devem ser o "owner". */
+const GENERIC_LIB_RE_CORR = /(?:jquery|lodash|underscore|moment|axios|rxjs|zone\.js|polyfill|angular\/core|react\/cjs|vue\.runtime|vendor\.|chunk\.)/i;
+
+/** Padrões Sankhya — frames com esses padrões ganham bônus de score. */
+const SANKHYA_HINT_RE = /ServiceProxy|CRUDService|ActionExecutor|sankhya|openForm|loadForm|saveForm|notifyListeners|\.sbr|\/mge\//i;
+
+/**
+ * Calcula o score de um frame para determinar o "owner" (frame mais relevante).
+ * M9: ranqueamento estruturado por múltiplos critérios.
+ *
+ * Critérios (aditivos):
+ *  +4  fn não-anônima
+ *  +3  fn contém padrão Sankhya
+ *  +3  file contém padrão Sankhya
+ *  -2  lib genérica
+ *  +2  fn matches um FRONTEND_PATTERN
+ *  +1  fn tem padrão de método (camelCase com corpo de 5+ chars)
+ *
+ * @param {Object} frame  { fn, file, line, col }
+ * @param {Object[]} frontendPatterns  FRONTEND_PATTERNS
+ * @returns {number}
+ */
+function scoreFrame(frame, frontendPatterns) {
+  let score = 0;
+  const fn   = frame.fn   || '';
+  const file = frame.file || '';
+  if (fn && fn !== '(anonymous)') score += 4;
+  if (SANKHYA_HINT_RE.test(fn))   score += 3;
+  if (SANKHYA_HINT_RE.test(file)) score += 3;
+  if (GENERIC_LIB_RE_CORR.test(file)) score -= 2;
+  const haystack = `${fn} ${file}`;
+  if (frontendPatterns.some((p) => p.pattern.test(haystack))) score += 2;
+  if (fn.length >= 5 && /^[a-z][a-zA-Z]+$/.test(fn)) score += 1; // camelCase válido
+  return score;
+}
+
+/**
+ * Identifica o "dispatcher frame" — o frame que despacha para a lib de rede,
+ * mas NÃO é o owner lógico da chamada. Tipicamente o frame logo ACIMA do
+ * ServiceProxy/callService no stack.
+ *
+ * M9: separa "quem chamou o dispatch" de "quem é o responsável lógico".
+ *
+ * @param {Array} frames
+ * @returns {Object|null}
+ */
+function findDispatcherFrame(frames) {
+  if (!frames || frames.length < 2) return null;
+  for (let i = 0; i < frames.length - 1; i++) {
+    const curr = frames[i];
+    const next = frames[i + 1];
+    if (/ServiceProxy|callService|CRUDService|ActionExecutor/i.test(`${curr.fn} ${curr.file}`)) {
+      // O frame ACIMA (i+1) é quem chamou o dispatch
+      if (next.fn && next.fn !== '(anonymous)') return next;
+    }
+  }
+  return null;
+}
+
 /**
  * Testa um array de frames contra os FRONTEND_PATTERNS.
- * Retorna o melhor match (maior confiança) ou null.
+ * M9: usa scoreFrame para ranquear melhor e diferencia owner vs dispatcher.
  *
- * @param {Array<{fn:string, file:string, line:number, col:number}>|null} frames
- * @returns {{ frame: Object, pattern: Object, confidence: number }|null}
+ * @param {Array<{fn, file, line, col}>} frames
+ * @returns {{ frame, pattern, confidence, ownerFrame, dispatcherFrame }|null}
  */
 function matchFrames(frames) {
   if (!frames || !frames.length) return null;
-  let best = null;
 
-  for (const frame of frames) {
+  // Normaliza input: aceita tanto [{ fn, file }] (E1 antigo) quanto { frames, ownerFrame } (M6)
+  const rawFrames = Array.isArray(frames) ? frames : (frames.frames || []);
+  if (!rawFrames.length) return null;
+
+  // M9: ranqueia todos os frames para determinar o "owner" antes de buscar padrão
+  const scored = rawFrames.map((f) => ({ frame: f, score: scoreFrame(f, FRONTEND_PATTERNS) }));
+  scored.sort((a, b) => b.score - a.score);
+
+  let best = null;
+  for (const { frame } of scored) {
     const haystack = `${frame.fn || ''} ${frame.file || ''}`;
     for (const p of FRONTEND_PATTERNS) {
       if (p.pattern.test(haystack)) {
-        // Frames com fn explícito (não anônimo) têm +0.05 de bônus
         const frameBonus = (frame.fn && frame.fn !== '(anonymous)') ? 0.05 : 0;
-        const conf = Math.min(1.0, p.confidence + frameBonus);
+        const sankhyaBonus = SANKHYA_HINT_RE.test(haystack) ? 0.05 : 0;
+        const conf = Math.min(1.0, p.confidence + frameBonus + sankhyaBonus);
         if (!best || conf > best.confidence) {
-          best = { frame, pattern: p, confidence: conf };
+          best = {
+            frame,
+            pattern:         p,
+            confidence:      conf,
+            ownerFrame:      frames.ownerFrame ?? scored[0]?.frame ?? null, // M6 ownerFrame if available
+            dispatcherFrame: findDispatcherFrame(rawFrames),
+          };
         }
       }
     }
@@ -230,22 +307,62 @@ function fillTemplate(template, ctx) {
 // ---------------------------------------------------------------------------
 
 /**
- * E2 — Correlaciona uma requisição com o padrão frontend Sankhya que a originou.
+ * E2 / M9 — Correlaciona uma requisição com o padrão frontend que a originou.
  *
- * Tenta em ordem:
- *  1. callStack capturado pelo content-main.js (fonte 'content') — confiança × 1.0
+ * Tenta em ordem de qualidade decrescente:
+ *  0. M1/M2/M3: dados diretos da API Sankhya patchada (mais preciso — sem inferência)
+ *  1. callStack capturado pelo content-main.js — confiança × 1.0
  *  2. initiator.frames capturado pelo DevTools HAR — confiança × 0.85
  *  3. Inferência por serviceName — confiança × 0.6
  *
+ * M9: enriquece com ownerFrame (responsável lógico) e dispatcherFrame (quem disparou).
+ *
  * @param {Object} request  requisição normalizada
- * @returns {{
- *   frontendOwner: { file:string, fn:string, line:number, pattern:string, category:string }|null,
- *   confidence: number
- * }}
+ * @returns {{ frontendOwner, ownerFrame, dispatcherFrame, confidence, patternHint, category, source }}
  */
 export function correlate(request) {
+  // Tentativa 0: dados diretos da API Sankhya patchada (M1/M2/M3)
+  // Esses dados foram capturados ANTES da serialização HTTP — máxima precisão
+  const apiCall = request.apiCall;
+  if (apiCall) {
+    const apiStackMatch = matchFrames(apiCall.callStack);
+    const conf = Math.min(1.0, (apiStackMatch?.confidence ?? 0.88));
+    const ownerFrame      = apiCall.callStack?.ownerFrame ?? apiStackMatch?.ownerFrame ?? null;
+    const dispatcherFrame = apiStackMatch?.dispatcherFrame ?? null;
+    return {
+      frontendOwner: ownerFrame ? {
+        file:     ownerFrame.file,
+        fn:       ownerFrame.fn,
+        line:     ownerFrame.line ?? 0,
+        pattern:  apiCall.fn, // nome da função patchada é o padrão mais preciso possível
+        category: _categoryFromFn(apiCall.fn),
+      } : {
+        file:     null,
+        fn:       apiCall.fn,
+        line:     0,
+        pattern:  apiCall.fn,
+        category: _categoryFromFn(apiCall.fn),
+      },
+      ownerFrame,
+      dispatcherFrame,
+      confidence:   conf,
+      patternHint:  apiCall.fn,
+      category:     _categoryFromFn(apiCall.fn),
+      source:       'api-patch',   // capturado via monkey-patch (M1/M2)
+      thisContext:  apiCall.thisContext ?? null,
+      directArgs: {
+        serviceName: apiCall.serviceName,
+        application: apiCall.application,
+        resourceID:  apiCall.resourceID,
+        rawArg:      apiCall.rawArg,
+      },
+    };
+  }
+
   // Tentativa 1: call stack capturado no interceptor content-main.js
-  const stackMatch = matchFrames(request.callStack);
+  const callStack     = request.callStack;
+  // callStack pode ser objeto M6 ({ frames, rawStack, ownerFrame }) ou array legado
+  const stackMatch    = matchFrames(callStack);
   if (stackMatch && stackMatch.confidence >= 0.5) {
     return {
       frontendOwner: {
@@ -255,7 +372,10 @@ export function correlate(request) {
         pattern:  stackMatch.pattern.name,
         category: stackMatch.pattern.category,
       },
+      ownerFrame:      stackMatch.ownerFrame,
+      dispatcherFrame: stackMatch.dispatcherFrame,
       confidence: Math.min(1.0, stackMatch.confidence),
+      source: 'callStack',
     };
   }
 
@@ -273,7 +393,10 @@ export function correlate(request) {
           pattern:  initiatorMatch.pattern.name,
           category: initiatorMatch.pattern.category,
         },
-        confidence: conf,
+        ownerFrame:      initiatorMatch.ownerFrame,
+        dispatcherFrame: initiatorMatch.dispatcherFrame,
+        confidence:      conf,
+        source:          'initiator',
       };
     }
   }
@@ -285,13 +408,33 @@ export function correlate(request) {
   const snMatch = matchByServiceName(sn);
   if (snMatch) {
     return {
-      frontendOwner: null, // não sabemos o arquivo sem stack
+      frontendOwner: null,
+      ownerFrame:    null,
+      dispatcherFrame: null,
       confidence:    snMatch.confidence,
       patternHint:   snMatch.pattern.name,
+      category:      snMatch.pattern.category,
+      source:        'serviceName',
     };
   }
 
-  return { frontendOwner: null, confidence: 0 };
+  return { frontendOwner: null, ownerFrame: null, dispatcherFrame: null, confidence: 0 };
+}
+
+/**
+ * Mapeia o nome de uma função API Sankhya para uma categoria funcional.
+ * @param {string} fn
+ * @returns {string}
+ */
+function _categoryFromFn(fn) {
+  if (!fn) return 'unknown';
+  const fl = fn.toLowerCase();
+  if (fl.includes('save') || fl.includes('remove') || fl.includes('delete')) return 'persist';
+  if (fl.includes('load') || fl.includes('query')) return 'query';
+  if (fl.includes('action') || fl.includes('execute')) return 'action';
+  if (fl.includes('form')) return 'navigation';
+  if (fl.includes('listener') || fl.includes('event')) return 'event';
+  return 'service-call';
 }
 
 /**

@@ -139,9 +139,24 @@
 
     // Valida que a mensagem veio da mesma janela (rejeita iframes externos)
     if (event.source !== window) return;
+    if (!event.data) return;
 
-    // Valida o tipo de mensagem
-    if (!event.data || event.data.type !== MSG_TYPE) return;
+    // M1/M2/M3: roteamento de mensagens por tipo
+    if (event.data.type === '__SNKY_MON_API_CALL__') {
+      // Chamada API Sankhya interna (ServiceProxy, CRUDService, etc.)
+      // Enviada sem batching pois deve chegar ANTES do request HTTP para correlação
+      if (!isMonitoring || !event.data.data) return;
+      try {
+        chrome.runtime.sendMessage({
+          action:  'SANKHYA_API_CALL_CAPTURED',
+          apiCall: event.data.data,
+        }).catch(() => {});
+      } catch (_) {}
+      return;
+    }
+
+    // Valida o tipo de mensagem de captura HTTP
+    if (event.data.type !== MSG_TYPE) return;
 
     // Não processa se a sessão não estiver ativa
     if (!isMonitoring) return;

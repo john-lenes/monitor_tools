@@ -28,7 +28,8 @@
   // colidir com o código JavaScript do Sankhya.
 
   // Prefixo da mensagem — deve ser idêntico ao content-bridge.js
-  const MSG_TYPE = '__SNKY_MON_CAPTURE__';
+  const MSG_TYPE        = '__SNKY_MON_CAPTURE__';
+  const MSG_TYPE_API    = '__SNKY_MON_API_CALL__'; // M1/M2: chamadas API internas Sankhya
 
   // Tamanho máximo do corpo (request/response) enviado à extensão.
   // 8192 bytes = 8 KB: cobre o payload JSON típico do Sankhya sem
@@ -36,15 +37,26 @@
   const MAX_BODY_LEN = 8192;
 
   // ---------------------------------------------------------------------------
-  // E1 — Captura de call stack
+  // M6 — Captura de call stack enriquecida (rawStack + ownerFrame)
   // ---------------------------------------------------------------------------
 
+  /** Padrões de ruído a filtrar dos frames (extensão, webpack, browser internals). */
+  const STACK_NOISE_RE = /chrome-extension:|node_modules|webpack-internal:|__SNKY_MON|MonitorXHR|patchFn|patchWhenAvailable/;
+
+  /** Padrões que indicam libs genéricas (não-Sankhya) — owner frame não deve ser delas. */
+  const GENERIC_LIB_RE = /(?:jquery|lodash|underscore|moment|axios|rxjs|zone\.js|polyfill|angular\/core|react\/cjs|vue\.runtime)/i;
+
+  /** Padrões de código Sankhya — frames que os contêm têm mais peso como owner. */
+  const SANKHYA_FRAME_RE = /ServiceProxy|CRUDService|ActionExecutor|sankhya|mge|openForm|loadForm|saveForm|notifyListeners/i;
+
   /**
-   * Parseia uma string de stack trace (new Error().stack) e extrai os frames
-   * relevantes, filtrando ruído da extensão e de módulos internos.
+   * Parseia um stack trace enriquecido.
+   * Retorna frames filtrados + rawStack truncado + ownerFrame (primeiro frame "dono" relevante).
+   *
+   * M6: além dos frames resumidos, preserva rawStack e calcula ownerFrame.
    *
    * @param {string} raw  string bruta de new Error().stack
-   * @returns {Array<{fn:string, file:string, line:number, col:number}>|null}
+   * @returns {{ frames: Array, rawStack: string, ownerFrame: Object|null }}
    */
   function parseStack(raw) {
     if (!raw || typeof raw !== 'string') return null;
@@ -52,17 +64,34 @@
     // Suporta dois formatos: "at fn (file:line:col)" e "at file:line:col"
     const re = /at (?:(.+?) \((.+?):(\d+):(\d+)\)|(.+?):(\d+):(\d+))/g;
     let m;
-    while ((m = re.exec(raw)) !== null && frames.length < 12) {
-      const fn   = m[1] || '(anonymous)';
+    while ((m = re.exec(raw)) !== null && frames.length < 20) {
+      const fn   = (m[1] || '(anonymous)').trim();
       const file = m[2] || m[5] || '';
       const line = parseInt(m[3] || m[6] || '0', 10);
       const col  = parseInt(m[4] || m[7] || '0', 10);
-      // Filtra ruído: própria extensão, node_modules, webpack internals, e este próprio script
-      if (/chrome-extension:|node_modules|webpack-internal:|parseStack|MonitorXHR/.test(file)) continue;
-      if (fn === 'parseStack') continue;
+      // Filtra ruído da extensão e internos do browser
+      if (STACK_NOISE_RE.test(file) || STACK_NOISE_RE.test(fn)) continue;
       frames.push({ fn, file, line, col });
     }
-    return frames.length ? frames : null;
+    if (!frames.length) return null;
+
+    // M6: calcula o "ownerFrame" — primeiro frame fora de libs genéricas e não-anônimo
+    let ownerFrame = null;
+    for (const f of frames) {
+      if (f.fn === '(anonymous)') continue;
+      if (GENERIC_LIB_RE.test(f.file)) continue;
+      ownerFrame = f;
+      break;
+    }
+    // Fallback: primeiro frame Sankhya mesmo que anônimo
+    if (!ownerFrame) {
+      ownerFrame = frames.find((f) => SANKHYA_FRAME_RE.test(f.fn) || SANKHYA_FRAME_RE.test(f.file)) ?? frames[0];
+    }
+
+    // M6: rawStack truncado (útil para debug quando o parser perde o frame)
+    const rawStack = raw.substring(0, 2000);
+
+    return { frames: frames.slice(0, 12), rawStack, ownerFrame };
   }
 
   // ---------------------------------------------------------------------------
@@ -76,6 +105,7 @@
   /**
    * Captura um evento DOM seguro (sem dados sensíveis) e o armazena no buffer.
    * Ignora campos de senha e elementos marcados como data-sensitive.
+   * M4: inclui contexto dos ancestrais do elemento (até 5 níveis).
    */
   function captureUIEvent(e) {
     try {
@@ -97,6 +127,8 @@
         data: el.dataset
           ? Object.fromEntries(Object.entries(el.dataset).slice(0, 5).map(([k, v]) => [k, String(v).substring(0, 60)]))
           : {},
+        // M4: contexto DOM dos ancestrais (estrutura de tela ao redor do elemento)
+        ancestors: e.type === 'click' ? captureAncestorContext(el) : undefined,
       };
 
       if (UI_EVENTS.length >= UI_EVENTS_MAX) UI_EVENTS.shift();
@@ -110,12 +142,15 @@
   });
 
   // ---------------------------------------------------------------------------
-  // E8 — Snapshot de contexto de tela
+  // M4 — Snapshot de contexto de tela enriquecido
   // ---------------------------------------------------------------------------
 
   /**
-   * Captura um snapshot do contexto visual atual da tela Sankhya (SPA).
-   * @returns {{ url:string, title:string, hash:string, breadcrumbs:string[] }}
+   * Captura screenshot enriquecido do contexto visual da tela Sankhya (SPA).
+   * M4: além de breadcrumbs, extrai aba ativa, modal/popup aberto, hints de formulário,
+   * contexto do registro selecionado (rowId, pk, entityName), e atributos data-*.
+   *
+   * @returns {Object}
    */
   function captureScreenSnapshot() {
     try {
@@ -126,20 +161,249 @@
         .filter(Boolean)
         .slice(0, 6);
 
+      // M4: aba ativa (tab panels Sankhya)
+      let activeTab = null;
+      try {
+        const tabEl = document.querySelector(
+          '.tab-item.active, [class*=tab].active, [class*=tab][aria-selected="true"], [role=tab][aria-selected="true"]'
+        );
+        if (tabEl) activeTab = (tabEl.innerText || tabEl.getAttribute('title') || '').trim().substring(0, 60) || null;
+      } catch (_) {}
+
+      // M4: modal/popup aberto
+      let modalTitle = null;
+      try {
+        const modalEl = document.querySelector(
+          '[class*=modal] [class*=title], [class*=dialog] [class*=title], [class*=popup] [class*=header], [role=dialog] h1, [role=dialog] h2'
+        );
+        if (modalEl) modalTitle = (modalEl.innerText || '').trim().substring(0, 80) || null;
+      } catch (_) {}
+
+      // M4: hints de formulário — captura data-*, resource-id, form-id, component-id, application
+      const formHints = {};
+      try {
+        const containerSelectors = [
+          '[data-form-id]', '[data-component-id]', '[data-resource-id]',
+          '[form-id]', '[component-id]', '[resource-id]',
+          '[class*=sankhya-form]', '[class*=form-panel]', '[data-application]',
+        ];
+        for (const sel of containerSelectors) {
+          const el = document.querySelector(sel);
+          if (!el) continue;
+          if (el.dataset.formId || el.getAttribute('form-id'))
+            formHints.formId = (el.dataset.formId || el.getAttribute('form-id') || '').substring(0, 60);
+          if (el.dataset.componentId || el.getAttribute('component-id'))
+            formHints.componentId = (el.dataset.componentId || el.getAttribute('component-id') || '').substring(0, 60);
+          if (el.dataset.resourceId || el.getAttribute('resource-id'))
+            formHints.resourceId = (el.dataset.resourceId || el.getAttribute('resource-id') || '').substring(0, 60);
+          if (el.dataset.application || el.getAttribute('data-application'))
+            formHints.application = (el.dataset.application || el.getAttribute('data-application') || '').substring(0, 60);
+        }
+      } catch (_) {}
+
+      // M4: contexto do registro selecionado (linha da grid, pk, entityName)
+      const selectedContext = {};
+      try {
+        const rowEl = document.querySelector('.grid-row.selected, [class*=row][class*=selected], tr.selected, [aria-selected="true"]');
+        if (rowEl) {
+          selectedContext.rowId      = (rowEl.dataset.rowid      || rowEl.getAttribute('data-rowid')      || '').substring(0, 60) || undefined;
+          selectedContext.pk         = (rowEl.dataset.pk         || rowEl.getAttribute('data-pk')         || '').substring(0, 100) || undefined;
+          selectedContext.entityName = (rowEl.dataset.entityname || rowEl.getAttribute('data-entityname') || '').substring(0, 60) || undefined;
+        }
+        // Tenta pk em inputs ocultos com o nome "pk" ou "nunota"
+        if (!selectedContext.pk) {
+          const pkInput = document.querySelector('input[name="pk"], input[name="nunota"], input[data-pk]');
+          if (pkInput) selectedContext.pk = pkInput.value.substring(0, 100) || undefined;
+        }
+      } catch (_) {}
+
       return {
-        url:         location.href,
-        title:       document.title,
-        hash:        location.hash,
+        url:             location.href,
+        title:           document.title,
+        hash:            location.hash,
         breadcrumbs,
+        activeTab:       activeTab   || undefined,
+        modalTitle:      modalTitle  || undefined,
+        formHints:       Object.keys(formHints).length      ? formHints      : undefined,
+        selectedContext: Object.keys(selectedContext).length ? selectedContext : undefined,
       };
     } catch (_) {
       return { url: location.href, title: '', hash: location.hash, breadcrumbs: [] };
     }
   }
 
+  /**
+   * Captura o contexto DOM dos ancestrais do elemento clicado (até 5 níveis acima).
+   * Usada pelo captureUIEvent para enriquecer cliques com contexto estrutural.
+   * M4: captura data-* e atributos relevantes dos ancestrais.
+   *
+   * @param {Element} el  elemento alvo do evento
+   * @returns {Array<{tag, id, cls, data}>}
+   */
+  function captureAncestorContext(el) {
+    const ancestors = [];
+    let node = el?.parentElement;
+    for (let i = 0; i < 5 && node && node !== document.body; i++) {
+      const data = {};
+      for (const [k, v] of Object.entries(node.dataset || {})) {
+        // Filtra keys pequenas e relevantes; ignora data muito longas
+        if (k.length < 40 && String(v).length < 80) data[k] = v;
+      }
+      ancestors.push({
+        tag: node.tagName?.toLowerCase(),
+        id:  node.id ? node.id.substring(0, 40) : undefined,
+        cls: node.className ? String(node.className).substring(0, 60) : undefined,
+        data: Object.keys(data).length ? data : undefined,
+      });
+      node = node.parentElement;
+    }
+    return ancestors;
+  }
+
   /** Snapshot atual — atualizado ao mudar rota (SPA hashchange). */
   let currentSnapshot = captureScreenSnapshot();
   window.addEventListener('hashchange', () => { currentSnapshot = captureScreenSnapshot(); });
+
+  // ---------------------------------------------------------------------------
+  // M1 + M2 — Monkey-patch de APIs Sankhya internas
+  // ---------------------------------------------------------------------------
+  // Em vez de inferir "quem chamou" a partir do stack HTTP, interceptamos
+  // diretamente as funções do framework Sankhya (ServiceProxy, CRUDService, etc.)
+  // ANTES da serialização do payload. Isso fornece:
+  //   - serviceName / application / resourceID diretamente dos argumentos
+  //   - payload original antes de virar body HTTP
+  //   - contexto `this` (componente/tela que originou a chamada)
+  //   - nome da função chamadora explícito
+  //
+  // O evento emitido (MSG_TYPE_API) é correlacionado no background.js com a
+  // requisição HTTP que vier logo a seguir (janela de 2s, mesmo serviceName).
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Emite uma captura de chamada API interna para o content-bridge via postMessage.
+   * Usa MSG_TYPE_API para que o bridge e background possam rotear separadamente.
+   */
+  function emitApiCall(data) {
+    try {
+      window.postMessage({ type: MSG_TYPE_API, data }, '*');
+    } catch (_) {}
+  }
+
+  /**
+   * Tenta extrair serviceName, application e resourceID do primeiro argumento
+   * de uma chamada de API Sankhya, dado que o argumento pode ser um objeto config
+   * ou uma string de serviço.
+   *
+   * @param {string} fnName  nome da função patchada (ex: 'ServiceProxy.callService')
+   * @param {any[]}  args    argumentos originais passados à função
+   * @returns {{ serviceName, application, resourceID, rawArg }}
+   */
+  function extractApiArgs(fnName, args) {
+    const first = args[0];
+    let serviceName  = null;
+    let application  = null;
+    let resourceID   = null;
+    let rawArg       = null;
+
+    try {
+      if (typeof first === 'string') {
+        serviceName = first.substring(0, 120);
+      } else if (first && typeof first === 'object') {
+        serviceName = String(first.serviceName || first.service || first.name || '').substring(0, 120) || null;
+        application = String(first.application || first.app || '').substring(0, 80) || null;
+        resourceID  = String(first.resourceID  || first.resourceId || first.id || '').substring(0, 80) || null;
+        // Serializa apenas as chaves superficiais (sem dados sensíveis profundos)
+        const keys = Object.keys(first).slice(0, 10);
+        rawArg = JSON.stringify(Object.fromEntries(keys.map((k) => [k, typeof first[k] === 'object' ? '[Object]' : first[k]]))).substring(0, 512);
+      }
+      // Segundo argumento: pode conter application ou payload
+      const second = args[1];
+      if (!application && second && typeof second === 'object') {
+        application = String(second.application || second.app || '').substring(0, 80) || null;
+      }
+    } catch (_) {}
+
+    return { serviceName, application, resourceID, rawArg };
+  }
+
+  /**
+   * Cria um wrapper de patch para um método do objeto alvo.
+   * Captura: nome da função, argumentos, `this` context digest, call stack.
+   *
+   * @param {Object} target   objeto que contém o método (ex: window.ServiceProxy)
+   * @param {string} method   nome do método a patchar (ex: 'callService')
+   * @param {string} fullName nome completo para exibição (ex: 'ServiceProxy.callService')
+   */
+  function patchMethod(target, method, fullName) {
+    const original = target[method];
+    if (typeof original !== 'function') return;
+    // Marca para não repatchar se o script for injetado mais de uma vez
+    if (original.__snkyPatched) return;
+
+    target[method] = function patchFn(...args) {
+      try {
+        const callStack = parseStack(new Error().stack);
+        const { serviceName, application, resourceID, rawArg } = extractApiArgs(fullName, args);
+        emitApiCall({
+          fn:          fullName,
+          serviceName,
+          application,
+          resourceID,
+          rawArg,
+          // M2: captura contexto `this` resumido (nome do componente/classe)
+          thisContext: (this?.constructor?.name
+                     || this?.componentId
+                     || this?.id
+                     || '') .toString().substring(0, 60) || null,
+          callStack,
+          uiContext:    UI_EVENTS.slice(-3).filter((ev) => ev.ts > Date.now() - 5000),
+          screenContext: currentSnapshot,
+          ts:           Date.now(),
+        });
+      } catch (_) { /* captura nunca interrompe a aplicação */ }
+
+      return original.apply(this, args);
+    };
+    target[method].__snkyPatched = true;
+  }
+
+  /**
+   * Tenta patchar um conjunto de métodos de um objeto no `window`.
+   * Repete com retry exponencial (até 10 tentativas, máx 30s) para cobrir
+   * o caso em que o Sankhya carrega os objetos de forma assíncrona após o
+   * script ser injetado.
+   *
+   * @param {string}   objName  nome do objeto no window (ex: 'ServiceProxy')
+   * @param {string[]} methods  lista de métodos a patchar (ex: ['callService'])
+   * @param {number}   attempt  tentativa atual (controle interno)
+   */
+  function patchWhenAvailable(objName, methods, attempt = 0) {
+    const obj = window[objName];
+    if (obj && typeof obj === 'object') {
+      methods.forEach((m) => patchMethod(obj, m, `${objName}.${m}`));
+      return; // sucesso — todos os métodos encontrados
+    }
+    // Retry com backoff: 100ms, 200ms, 400ms, … até 10240ms (10 tentativas)
+    if (attempt < 10) {
+      setTimeout(() => patchWhenAvailable(objName, methods, attempt + 1), Math.min(100 * (2 ** attempt), 10240));
+    }
+  }
+
+  // Lista de APIs Sankhya a interceptar
+  // ServiceProxy é o ponto central — quase todos os serviços passam por ele
+  patchWhenAvailable('ServiceProxy',  ['callService']);
+  patchWhenAvailable('CRUDService',   ['loadRecords', 'save', 'remove', 'loadGrid']);
+  patchWhenAvailable('ActionExecutor',['execute']);
+  // Funções globais do framework
+  ['openForm', 'loadForm', 'saveForm', 'notifyListeners', 'dispatchEvent', 'triggerEvent']
+    .forEach((fn) => {
+      if (typeof window[fn] === 'function' && !window[fn].__snkyPatched) {
+        patchMethod(window, fn, fn);
+      } else {
+        // Para funções globais, tentamos com patchWhenAvailable
+        patchWhenAvailable(fn, [fn]);
+      }
+    });
 
   // ---------------------------------------------------------------------------
   // Filtros rápidos (executados no MAIN world para não sobrecarregar o bridge)
